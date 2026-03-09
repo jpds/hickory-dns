@@ -93,9 +93,19 @@ impl<T: RequestHandler> Server<T> {
                 handler,
                 access,
                 shutdown: CancellationToken::new(),
+                #[cfg(feature = "dnstap")]
+                dnstap: None,
             }),
             join_set: JoinSet::new(),
         }
+    }
+
+    /// Set a DNSTAP client for logging DNS events.
+    #[cfg(feature = "dnstap")]
+    pub fn set_dnstap_client(&mut self, client: crate::dnstap::DnstapClient) {
+        Arc::get_mut(&mut self.context)
+            .expect("set_dnstap_client must be called before registering listeners")
+            .dnstap = Some(Arc::new(client));
     }
 
     /// Register a UDP socket. Should be bound before calling this function.
@@ -690,6 +700,10 @@ pub(super) struct ReportingResponseHandler<R: ResponseHandler> {
     handler: R,
     #[cfg(feature = "metrics")]
     metrics: ResponseHandlerMetrics,
+    #[cfg(feature = "dnstap")]
+    dnstap: Option<Arc<crate::dnstap::DnstapClient>>,
+    #[cfg(feature = "dnstap")]
+    query_bytes: Bytes,
 }
 
 #[async_trait::async_trait]
@@ -746,6 +760,14 @@ impl<R: ResponseHandler> ResponseHandler for ReportingResponseHandler<R> {
         #[cfg(feature = "metrics")]
         self.metrics.update(self, &response_info);
 
+        #[cfg(feature = "dnstap")]
+        if let Some(ref dnstap) = self.dnstap {
+            // Log AUTH_RESPONSE without wire-format response bytes.
+            // The response_message field is optional in the DNSTAP spec;
+            // all metadata (timing, addresses, protocol) is still captured.
+            dnstap.log_response(self.src_addr, self.protocol, &self.query_bytes, &[]);
+        }
+
         Ok(response_info)
     }
 }
@@ -754,6 +776,8 @@ struct ServerContext<T> {
     handler: T,
     access: AccessControl,
     shutdown: CancellationToken,
+    #[cfg(feature = "dnstap")]
+    dnstap: Option<Arc<crate::dnstap::DnstapClient>>,
 }
 
 impl<T: RequestHandler> ServerContext<T> {
@@ -810,6 +834,10 @@ impl<T: RequestHandler> ServerContext<T> {
 
             return;
         }
+
+        // Save a copy of the raw query bytes for DNSTAP logging before they are moved.
+        #[cfg(feature = "dnstap")]
+        let raw_query_bytes = message_bytes.clone();
 
         // Attempt to decode the message
         let request = match MessageRequest::read(&mut decoder, header) {
@@ -873,6 +901,11 @@ impl<T: RequestHandler> ServerContext<T> {
             );
         }
 
+        #[cfg(feature = "dnstap")]
+        if let Some(ref dnstap) = self.dnstap {
+            dnstap.log_query(src_addr, protocol, &raw_query_bytes);
+        }
+
         // The reporter will handle making sure to log the result of the request
         let queries = request.queries.queries().to_vec();
         let reporter = ReportingResponseHandler {
@@ -883,6 +916,10 @@ impl<T: RequestHandler> ServerContext<T> {
             handler: response_handler,
             #[cfg(feature = "metrics")]
             metrics: ResponseHandlerMetrics::default(),
+            #[cfg(feature = "dnstap")]
+            dnstap: self.dnstap.clone(),
+            #[cfg(feature = "dnstap")]
+            query_bytes: raw_query_bytes,
         };
 
         self.handler
@@ -923,6 +960,10 @@ async fn error_response_handler(
         handler: response_handler,
         #[cfg(feature = "metrics")]
         metrics: ResponseHandlerMetrics::default(),
+        #[cfg(feature = "dnstap")]
+        dnstap: None,
+        #[cfg(feature = "dnstap")]
+        query_bytes: Bytes::new(),
     };
 
     let response = MessageResponseBuilder::new(&queries, None);
