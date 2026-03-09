@@ -297,6 +297,8 @@ impl DnsServer {
             allow_networks,
             udp_socket: udp_socket_config,
             tcp_socket: tcp_socket_config,
+            #[cfg(feature = "dnstap")]
+                dnstap: _,
         } = config;
 
         #[cfg(unix)]
