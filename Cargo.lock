@@ -1118,6 +1118,7 @@ dependencies = [
  "prefix-trie",
  "prost",
  "prost-build",
+ "protox",
  "rusqlite",
  "rustls",
  "serde",
