@@ -169,22 +169,37 @@ impl DnsServer {
     /// Create a DNSTAP tracing layer from the server configuration file.
     ///
     /// This should be called before the tracing subscriber is initialized,
-    /// so the layer can be included in the subscriber stack.
+    /// so the layer can be included in the subscriber stack.  The returned
+    /// [`DnstapConnection`](hickory_dnstap::DnstapConnection) must be
+    /// [`start`](hickory_dnstap::DnstapConnection::start)ed inside the Tokio
+    /// runtime after startup logging is complete.
     #[cfg(feature = "dnstap")]
-    pub fn create_dnstap_layer(&self) -> Result<Option<hickory_dnstap::DnstapLayer>, String> {
+    pub fn create_dnstap_layer(
+        &self,
+    ) -> Result<
+        (
+            Option<hickory_dnstap::DnstapLayer>,
+            Option<hickory_dnstap::DnstapConnection>,
+        ),
+        String,
+    > {
         let config_path = Path::new(&self.config);
         let config = Config::read_config(config_path)
             .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
         if let Some(dnstap_section) = config.dnstap {
             if dnstap_section.enabled {
                 let dnstap_config = dnstap_section.into_dnstap_config()?;
-                return Ok(Some(hickory_dnstap::DnstapLayer::new(dnstap_config)));
+                let (layer, connection) = hickory_dnstap::DnstapLayer::new(dnstap_config);
+                return Ok((Some(layer), Some(connection)));
             }
         }
-        Ok(None)
+        Ok((None, None))
     }
 
-    pub async fn run(self) -> Result<(), String> {
+    pub async fn run(
+        self,
+        #[cfg(feature = "dnstap")] dnstap_connection: Option<hickory_dnstap::DnstapConnection>,
+    ) -> Result<(), String> {
         let Self {
             validate,
             workers: _, // Used in `main()`
@@ -508,6 +523,11 @@ impl DnsServer {
                 }
             });
             info!(?interval, "systemd watchdog enabled");
+        }
+
+        #[cfg(feature = "dnstap")]
+        if let Some(connection) = dnstap_connection {
+            connection.start();
         }
 
         match server.block_until_done().await {
