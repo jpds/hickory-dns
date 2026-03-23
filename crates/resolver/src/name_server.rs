@@ -275,6 +275,10 @@ impl<P: ConnectionProvider> NameServer<P> {
         self.config.ip
     }
 
+    pub(super) fn provider_id(&self) -> Option<&Arc<str>> {
+        self.config.provider_id()
+    }
+
     pub(crate) fn decayed_srtt(&self) -> f64 {
         self.server_srtt.current()
     }

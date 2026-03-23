@@ -316,6 +316,20 @@ impl NameServerConfig {
             connections,
         }
     }
+
+    /// Returns a provider identifier for this name server.
+    ///
+    /// Servers that share the same DNS server hostname (e.g. `"cloudflare-dns.com"`) are
+    /// considered to belong to the same provider. This can be used by the pool to
+    /// diversify concurrent requests across providers instead of sending parallel
+    /// queries to two IPs that share the same upstream operator.
+    ///
+    /// Returns `None` for plaintext (UDP/TCP) servers with no configured hostname.
+    pub fn provider_id(&self) -> Option<&Arc<str>> {
+        self.connections
+            .iter()
+            .find_map(|conn| conn.protocol.server_name())
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -465,6 +479,22 @@ impl ProtocolConfig {
             ProtocolConfig::Quic { .. } => Protocol::Quic,
             #[cfg(feature = "__h3")]
             ProtocolConfig::H3 { .. } => Protocol::H3,
+        }
+    }
+
+    /// Returns the DNS server name, if the protocol uses a TLS-enabled
+    /// transport.
+    pub fn server_name(&self) -> Option<&Arc<str>> {
+        match self {
+            ProtocolConfig::Udp | ProtocolConfig::Tcp => None,
+            #[cfg(feature = "__tls")]
+            ProtocolConfig::Tls { server_name } => Some(server_name),
+            #[cfg(feature = "__https")]
+            ProtocolConfig::Https { server_name, .. } => Some(server_name),
+            #[cfg(feature = "__quic")]
+            ProtocolConfig::Quic { server_name } => Some(server_name),
+            #[cfg(feature = "__h3")]
+            ProtocolConfig::H3 { server_name, .. } => Some(server_name),
         }
     }
 

@@ -301,15 +301,41 @@ impl<P: ConnectionProvider> PoolState<P> {
                 return Err(NetError::Timeout);
             }
 
-            // construct the parallel requests, 2 is the default
+            // Construct the parallel requests, 2 is the default.
+            // When possible, pick servers from distinct providers so that a single
+            // provider outage doesn't take out the entire parallel batch.
             let mut par_servers = SmallVec::<[_; 2]>::new();
-            while !servers.is_empty()
-                && par_servers.len() < Ord::max(self.cx.options.num_concurrent_reqs, 1)
-            {
-                if let Some(server) = servers.pop_front() {
-                    if policy.allows_server(&server) {
-                        par_servers.push(server);
+            let mut deferred = SmallVec::<[_; 4]>::new();
+            let max_par = Ord::max(self.cx.options.num_concurrent_reqs, 1);
+            while !servers.is_empty() && par_servers.len() < max_par {
+                let Some(server) = servers.pop_front() else {
+                    break;
+                };
+                if !policy.allows_server(&server) {
+                    continue;
+                }
+                // If the server has a provider id that's already in the batch, defer
+                // it so we get provider diversity. Servers without a provider id
+                // (plain UDP/TCP) are always eligible.
+                if let Some(id) = server.provider_id() {
+                    if par_servers.iter().any(|s: &Arc<NameServer<P>>| {
+                        s.provider_id().is_some_and(|existing| existing == id)
+                    }) {
+                        deferred.push(server);
+                        continue;
                     }
+                }
+                par_servers.push(server);
+            }
+
+            // If we couldn't fill the batch with distinct providers, use deferred
+            // servers rather than leaving slots empty.
+            while let Some(server) = deferred.pop() {
+                if par_servers.len() >= max_par {
+                    // Push back in reverse order to preserve SRTT ordering.
+                    servers.push_front(server);
+                } else {
+                    par_servers.push(server);
                 }
             }
 
@@ -988,11 +1014,114 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::config::{NameServerConfig, ResolverConfig, ServerOrderingStrategy};
+    use crate::config::{ConnectionConfig, NameServerConfig, ResolverConfig, ServerOrderingStrategy};
     use crate::net::runtime::{RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime};
     use crate::net::xfer::{DnsHandle, FirstAnswer};
     use crate::proto::op::{DnsRequestOptions, Query};
     use crate::proto::rr::{Name, RecordType};
+
+    /// Test that when multiple servers share the same DNS server name (i.e.
+    /// same provider), the pool picks servers from distinct providers for its
+    /// parallel batch rather than sending both concurrent requests to the same
+    /// provider.
+    #[cfg(feature = "__tls")]
+    #[tokio::test]
+    async fn test_provider_diversity_in_parallel_batch() {
+        subscribe();
+
+        let provider_a_ip1 = IpAddr::from([10, 0, 0, 1]);
+        let provider_a_ip2 = IpAddr::from([10, 0, 0, 2]);
+        let provider_b_ip1 = IpAddr::from([10, 0, 1, 1]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        // All three servers have responses registered, but A1's response is
+        // mutated to NXDomain.  Combined with trust_negative_responses: false on
+        // A1, the pool will treat A1's NXDomain as untrusted and continue to the
+        // next server in the parallel batch — which must be B1 if diversity
+        // selection works correctly.
+        let responses = vec![
+            MockRecord::a(provider_a_ip1, &query_name, provider_a_ip1),
+            MockRecord::a(provider_a_ip2, &query_name, provider_a_ip2),
+            MockRecord::a(provider_b_ip1, &query_name, provider_b_ip1),
+        ];
+        let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
+            move |ip, _proto, msg| {
+                if ip == provider_a_ip1 {
+                    msg.set_response_code(ResponseCode::NXDomain);
+                    msg.take_answers();
+                }
+            },
+        ));
+        let mock_provider = MockProvider::new(handler);
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 2,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        // Each server has both a UDP and TLS connection config so that:
+        //  - provider_id() returns the DNS server hostname (for diversity selection)
+        //  - the mock provider can actually connect via UDP
+        //
+        // A1 has trust_negative_responses: false so its NXDomain is retryable.
+        let make_config = |ip, server_name: &str, trust_negative: bool| NameServerConfig {
+            ip,
+            trust_negative_responses: trust_negative,
+            connections: vec![
+                ConnectionConfig::udp(),
+                ConnectionConfig::tls(Arc::from(server_name)),
+            ],
+        };
+        let ns_a1 = Arc::new(NameServer::new(
+            [].into_iter(),
+            make_config(provider_a_ip1, "provider-a.example", false),
+            &opts,
+            mock_provider.clone(),
+        ));
+        let ns_a2 = Arc::new(NameServer::new(
+            [].into_iter(),
+            make_config(provider_a_ip2, "provider-a.example", true),
+            &opts,
+            mock_provider.clone(),
+        ));
+        let ns_b1 = Arc::new(NameServer::new(
+            [].into_iter(),
+            make_config(provider_b_ip1, "provider-b.example", true),
+            &opts,
+            mock_provider.clone(),
+        ));
+
+        let pool = NameServerPool::from_nameservers(
+            vec![ns_a1, ns_a2, ns_b1],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        let _response = pool
+            .lookup(
+                Query::query(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("lookup should succeed");
+
+        // Verify diversity: A1 returned untrusted NXDomain so the pool falls
+        // through to B1 (same batch).  If diversity were broken, A2 would have
+        // been in the batch instead and the lookup would have failed (A1=NXDomain,
+        // A2=success but never reached because pool returns first success).
+        let queries = mock_provider.queries(&provider_b_ip1);
+        assert!(
+            !queries.is_empty(),
+            "provider-b ip1 should have been queried (diversity put it in the batch)"
+        );
+        let a2_queries = mock_provider.queries(&provider_a_ip2);
+        assert!(
+            a2_queries.is_empty(),
+            "provider-a ip2 should NOT have been queried in the first batch \
+             (pool should have preferred provider-b for diversity)"
+        );
+    }
 
     #[ignore]
     // because of there is a real connection that needs a reasonable timeout
