@@ -52,10 +52,12 @@ impl<S: DnsTcpStream> TcpClientStream<S> {
         bind_addr: Option<SocketAddr>,
         timeout: Duration,
         max_active_requests: Option<usize>,
+        connect_timeout: Duration,
+        _request_timeout: Duration,
         provider: P,
     ) -> Result<DnsExchange<P>, NetError> {
         let mut handle = provider.create_handle();
-        let (future, sender) = Self::new(remote_addr, bind_addr, Some(timeout), provider);
+        let (future, sender) = Self::new(remote_addr, bind_addr, Some(connect_timeout), provider);
 
         // TODO: need config for Signer...
         let mut multiplexer = DnsMultiplexer::new(future.await?, sender).with_timeout(timeout);
