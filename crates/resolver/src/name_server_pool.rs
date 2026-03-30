@@ -302,21 +302,24 @@ impl<P: ConnectionProvider> PoolState<P> {
             }
 
             // Construct the parallel requests, 2 is the default.
-            // When possible, pick servers from distinct providers so that a single
-            // provider outage doesn't take out the entire parallel batch.
+            // When possible, pick servers from distinct providers AND distinct
+            // address families. This way, a single provider outage or a broken
+            // network path doesn't consume all parallel slots.
             let mut par_servers = SmallVec::<[_; 2]>::new();
             let mut deferred = SmallVec::<[_; 4]>::new();
+
             let max_par = Ord::max(self.cx.options.num_concurrent_reqs, 1);
+
             while !servers.is_empty() && par_servers.len() < max_par {
                 let Some(server) = servers.pop_front() else {
                     break;
                 };
+
                 if !policy.allows_server(&server) {
                     continue;
                 }
-                // If the server has a provider id that's already in the batch, defer
-                // it so we get provider diversity. Servers without a provider id
-                // (plain UDP/TCP) are always eligible.
+
+                // Defer if this server's provider is already in the batch.
                 if let Some(id) = server.provider_id() {
                     if par_servers.iter().any(|s: &Arc<NameServer<P>>| {
                         s.provider_id().is_some_and(|existing| existing == id)
@@ -325,11 +328,21 @@ impl<P: ConnectionProvider> PoolState<P> {
                         continue;
                     }
                 }
+
+                // Defer if this address family is already represented.
+                if par_servers
+                    .iter()
+                    .any(|s: &Arc<NameServer<P>>| s.ip().is_ipv6() == server.ip().is_ipv6())
+                {
+                    deferred.push(server);
+                    continue;
+                }
+
                 par_servers.push(server);
             }
 
-            // If we couldn't fill the batch with distinct providers, use deferred
-            // servers rather than leaving slots empty.
+            // If we couldn't fill the batch with distinct providers/families,
+            // use deferred servers rather than leaving slots empty.
             while let Some(server) = deferred.pop() {
                 if par_servers.len() >= max_par {
                     // Push back in reverse order to preserve SRTT ordering.
@@ -1014,7 +1027,9 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::config::{ConnectionConfig, NameServerConfig, ResolverConfig, ServerOrderingStrategy};
+    use crate::config::{
+        ConnectionConfig, NameServerConfig, ResolverConfig, ServerOrderingStrategy,
+    };
     use crate::net::runtime::{RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime};
     use crate::net::xfer::{DnsHandle, FirstAnswer};
     use crate::proto::op::{DnsRequestOptions, Query};
@@ -1044,14 +1059,13 @@ mod tests {
             MockRecord::a(provider_a_ip2, &query_name, provider_a_ip2),
             MockRecord::a(provider_b_ip1, &query_name, provider_b_ip1),
         ];
-        let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
-            move |ip, _proto, msg| {
+        let handler =
+            MockNetworkHandler::new(responses).with_mutation(Box::new(move |ip, _proto, msg| {
                 if ip == provider_a_ip1 {
-                    msg.set_response_code(ResponseCode::NXDomain);
-                    msg.take_answers();
+                    msg.metadata.response_code = ResponseCode::NXDomain;
+                    msg.answers.clear();
                 }
-            },
-        ));
+            }));
         let mock_provider = MockProvider::new(handler);
 
         let opts = ResolverOpts {
