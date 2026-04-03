@@ -249,13 +249,11 @@ struct PoolState<P: ConnectionProvider> {
 
 impl<P: ConnectionProvider> PoolState<P> {
     async fn try_send(&self, request: DnsRequest) -> Result<DnsResponse, NetError> {
-        let mut servers = self.servers.clone();
+        let server_count = self.servers.len();
+        let mut indices: SmallVec<[usize; 6]> = (0..server_count).collect();
         match self.cx.options.server_ordering_strategy {
-            // select the highest priority connection
-            //   reorder the connections based on current view...
-            //   this reorders the inner set
             ServerOrderingStrategy::QueryStatistics => {
-                sort_servers_by_query_statistics(&mut servers);
+                sort_servers_by_query_statistics(&self.servers, &mut indices);
             }
             ServerOrderingStrategy::UserProvidedOrder => {}
             ServerOrderingStrategy::RoundRobin => {
@@ -264,12 +262,12 @@ impl<P: ConnectionProvider> PoolState<P> {
                 } else {
                     1
                 };
-                if num_concurrent_reqs < servers.len() {
+                if num_concurrent_reqs < server_count {
                     let index = self
                         .next
                         .fetch_add(num_concurrent_reqs, AtomicOrdering::SeqCst)
-                        % servers.len();
-                    servers.rotate_left(index);
+                        % server_count;
+                    indices.rotate_left(index);
                 }
             }
         }
@@ -287,9 +285,9 @@ impl<P: ConnectionProvider> PoolState<P> {
         // given up and retransmitted the query.
         let deadline = Instant::now() + self.cx.options.timeout;
 
-        let mut servers = VecDeque::from(servers);
+        let mut servers = VecDeque::from_iter(indices);
         let mut backoff = Duration::from_millis(20);
-        let mut busy = SmallVec::<[Arc<NameServer<P>>; 2]>::new();
+        let mut busy = SmallVec::<[usize; 2]>::new();
         let mut err = NetError::NoConnections;
         let mut policy = ConnectionPolicy::default();
 
@@ -300,13 +298,13 @@ impl<P: ConnectionProvider> PoolState<P> {
             }
 
             // construct the parallel requests, 2 is the default
-            let mut par_servers = SmallVec::<[_; 2]>::new();
+            let mut par_servers = SmallVec::<[usize; 2]>::new();
             while !servers.is_empty()
                 && par_servers.len() < Ord::max(self.cx.options.num_concurrent_reqs, 1)
             {
-                if let Some(server) = servers.pop_front() {
-                    if policy.allows_server(&server) {
-                        par_servers.push(server);
+                if let Some(idx) = servers.pop_front() {
+                    if policy.allows_server(&self.servers[idx]) {
+                        par_servers.push(idx);
                     }
                 }
             }
@@ -321,7 +319,10 @@ impl<P: ConnectionProvider> PoolState<P> {
                     <<P as ConnectionProvider>::RuntimeProvider as RuntimeProvider>::Timer::delay_for(
                         backoff.min(remaining),
                     ).await;
-                    servers.extend(busy.drain(..).filter(|ns| policy.allows_server(ns)));
+                    servers.extend(
+                        busy.drain(..)
+                            .filter(|&idx| policy.allows_server(&self.servers[idx])),
+                    );
                     backoff *= 2;
                     continue;
                 }
@@ -335,7 +336,8 @@ impl<P: ConnectionProvider> PoolState<P> {
             let batch_start = Instant::now();
             let mut requests = par_servers
                 .into_iter()
-                .map(|server| {
+                .map(|idx| {
+                    let server = &self.servers[idx];
                     let mut request = request.clone();
 
                     // Set the retry interval to 1.2 times the current decayed SRTT
@@ -345,7 +347,7 @@ impl<P: ConnectionProvider> PoolState<P> {
                     debug!(?retry_interval, ip = ?server.ip(), "setting retry_interval");
 
                     let future = server.clone().send(request, policy, &self.cx);
-                    async { (server, future.await) }
+                    async move { (idx, future.await) }
                 })
                 .collect::<FuturesUnordered<_>>();
 
@@ -353,20 +355,21 @@ impl<P: ConnectionProvider> PoolState<P> {
             // error) — used to avoid double-penalizing them.
             let mut completed = SmallVec::<[IpAddr; 2]>::new();
 
-            while let Some((server, result)) = requests.next().await {
-                completed.push(server.ip());
+            while let Some((idx, result)) = requests.next().await {
+                completed.push(self.servers[idx].ip());
                 let e = match result {
                     Ok(response) if response.truncation => {
                         debug!("truncated response received, retrying over TCP");
                         policy.disable_udp = true;
                         err = NetError::from("received truncated response");
-                        servers.push_front(server);
+                        servers.push_front(idx);
                         continue;
                     }
                     Ok(response) => {
                         // Penalize servers still in-flight (see `record_cancelled`).
                         let winner_rtt = batch_start.elapsed();
-                        for abandoned in &in_flight {
+                        for &abandoned_idx in &in_flight {
+                            let abandoned = &self.servers[abandoned_idx];
                             if !completed.contains(&abandoned.ip()) {
                                 debug!(ip = ?abandoned.ip(), ?winner_rtt, "recording cancelled parallel server");
                                 abandoned.record_cancelled(winner_rtt);
@@ -381,12 +384,12 @@ impl<P: ConnectionProvider> PoolState<P> {
                     // We assume the response is spoofed, so ignore it and avoid UDP server for this
                     // request to try and avoid further spoofing.
                     NetError::QueryCaseMismatch => {
-                        servers.push_front(server);
+                        servers.push_front(idx);
                         policy.disable_udp = true;
                         continue;
                     }
                     // If the server is busy, try it again later if necessary.
-                    NetError::Busy => busy.push(server),
+                    NetError::Busy => busy.push(idx),
                     // If the connection failed or timed out, try another one.
                     NetError::Io(_) | NetError::NoConnections | NetError::Timeout => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
@@ -394,7 +397,7 @@ impl<P: ConnectionProvider> PoolState<P> {
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
                         response_code: ResponseCode::NXDomain,
                         ..
-                    })) if !server.trust_negative_responses() => {}
+                    })) if !self.servers[idx].trust_negative_responses() => {}
                     _ => return Err(e),
                 }
 
@@ -440,11 +443,12 @@ fn most_specific(previous: NetError, current: NetError) -> NetError {
 /// that can change between calls due to concurrent query completions, which
 /// would violate the total-order invariant required by `sort_by`.
 pub(crate) fn sort_servers_by_query_statistics<P: ConnectionProvider>(
-    servers: &mut [Arc<NameServer<P>>],
+    servers: &[Arc<NameServer<P>>],
+    indices: &mut [usize],
 ) {
     // Positive f64 bit patterns sort in the same order as their float values,
     // so to_bits() is a valid u64 ordering key for non-negative SRTT values.
-    servers.sort_by_cached_key(|s| s.decayed_srtt().to_bits());
+    indices.sort_by_cached_key(|&idx| servers[idx].decayed_srtt().to_bits());
 }
 
 /// Context for a [`NameServerPool`]
@@ -1440,7 +1444,7 @@ mod tests {
         let opts = ResolverOpts::default();
         let mock_provider = MockProvider::new(MockNetworkHandler::new(vec![]));
 
-        let mut servers = (1..=50)
+        let servers = (1..=50)
             .map(|i| {
                 let ns = Arc::new(NameServer::new(
                     [],
@@ -1481,8 +1485,9 @@ mod tests {
         // thread concurrently modifies SRTT values. With sort_by_cached_key
         // this is safe. With sort_by, the concurrent modifications cause
         // inconsistent comparisons that panic the sort.
+        let mut indices: Vec<usize> = (0..servers.len()).collect();
         for _ in 0..100_000 {
-            sort_servers_by_query_statistics(&mut servers);
+            sort_servers_by_query_statistics(&servers, &mut indices);
         }
 
         stop.store(true, Ordering::Relaxed);
