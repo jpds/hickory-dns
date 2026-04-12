@@ -468,6 +468,7 @@ async fn handle_udp(
         };
 
         let src_addr = message.addr();
+        let local_ip = message.local_addr();
         debug!("received udp request from: {}", src_addr);
 
         // verify that the src address is safe for responses
@@ -481,7 +482,9 @@ async fn handle_udp(
         }
 
         let cx = cx.clone();
-        let stream_handle = stream_handle.with_remote_addr(src_addr);
+        let stream_handle = stream_handle
+            .with_remote_addr(src_addr)
+            .with_local_addr(local_ip);
         inner_join_set.spawn(async move {
             cx.handle_raw_request(message, Protocol::Udp, stream_handle, server_addr)
                 .await;

@@ -1026,6 +1026,7 @@ dependencies = [
  "idna",
  "ipnet",
  "jni",
+ "libc",
  "lru-cache",
  "parking_lot",
  "pin-project-lite",

@@ -8,7 +8,7 @@ use core::fmt::Display;
 use core::fmt::{self, Debug};
 use core::future::Future;
 use core::marker::PhantomData;
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -169,6 +169,7 @@ pub type StreamReceiver = Peekable<Fuse<mpsc::Receiver<SerialMessage>>>;
 #[derive(Clone)]
 pub struct BufDnsStreamHandle {
     remote_addr: SocketAddr,
+    local_addr: Option<IpAddr>,
     sender: mpsc::Sender<SerialMessage>,
 }
 
@@ -197,6 +198,7 @@ impl BufDnsStreamHandle {
 
         let this = Self {
             remote_addr,
+            local_addr: None,
             sender,
         };
 
@@ -209,16 +211,31 @@ impl BufDnsStreamHandle {
     pub fn with_remote_addr(&self, remote_addr: SocketAddr) -> Self {
         Self {
             remote_addr,
+            local_addr: self.local_addr,
             sender: self.sender.clone(),
         }
+    }
+
+    /// Associates a local address to use as the source when sending responses.
+    ///
+    /// Set to the destination address of the incoming query so that responses
+    /// are sent from the same address the client queried.
+    pub fn with_local_addr(mut self, local_addr: Option<IpAddr>) -> Self {
+        self.local_addr = local_addr;
+        self
     }
 }
 
 impl DnsStreamHandle for BufDnsStreamHandle {
     fn send(&mut self, buffer: SerialMessage) -> Result<(), NetError> {
         let sender: &mut _ = &mut self.sender;
+        let bytes = buffer.into_parts().0;
+        let mut msg = SerialMessage::new(bytes, self.remote_addr);
+        if let Some(ip) = self.local_addr {
+            msg.set_local_addr(ip);
+        }
         sender
-            .try_send(SerialMessage::new(buffer.into_parts().0, self.remote_addr))
+            .try_send(msg)
             .map_err(|e| NetError::from(format!("mpsc::SendError {e}")))
     }
 }

@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use alloc::vec::Vec;
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 
 use crate::op::Message;
 use crate::serialize::binary::DecodeError;
@@ -16,12 +16,19 @@ pub struct SerialMessage {
     // TODO: change to Bytes? this would be more compatible with some underlying libraries
     message: Vec<u8>,
     addr: SocketAddr,
+    /// For inbound UDP messages: the local address the packet was received on.
+    /// For outbound UDP messages: the local address to use as the source.
+    local_addr: Option<IpAddr>,
 }
 
 impl SerialMessage {
     /// Construct a new SerialMessage and the source or destination address
     pub fn new(message: Vec<u8>, addr: SocketAddr) -> Self {
-        Self { message, addr }
+        Self {
+            message,
+            addr,
+            local_addr: None,
+        }
     }
 
     /// Get a reference to the bytes
@@ -32,6 +39,19 @@ impl SerialMessage {
     /// Get the source or destination address (context dependent)
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Get the local address associated with this message, if known.
+    ///
+    /// For inbound UDP: the address the packet arrived at (query destination).
+    /// For outbound UDP: the source address to use when sending.
+    pub fn local_addr(&self) -> Option<IpAddr> {
+        self.local_addr
+    }
+
+    /// Set the local address on this message.
+    pub fn set_local_addr(&mut self, addr: IpAddr) {
+        self.local_addr = Some(addr);
     }
 
     /// Unwrap the Bytes and address
@@ -52,13 +72,17 @@ impl SerialMessage {
 
 impl From<(Vec<u8>, SocketAddr)> for SerialMessage {
     fn from((message, addr): (Vec<u8>, SocketAddr)) -> Self {
-        Self { message, addr }
+        Self {
+            message,
+            addr,
+            local_addr: None,
+        }
     }
 }
 
 impl From<SerialMessage> for (Vec<u8>, SocketAddr) {
     fn from(msg: SerialMessage) -> Self {
-        let SerialMessage { message, addr } = msg;
+        let SerialMessage { message, addr, .. } = msg;
         (message, addr)
     }
 }

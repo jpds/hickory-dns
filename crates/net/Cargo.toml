@@ -90,6 +90,9 @@ tokio-rustls = { workspace = true, optional = true, features = ["early-data"] }
 url = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { workspace = true }
 

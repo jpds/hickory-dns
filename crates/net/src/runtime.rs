@@ -2,7 +2,7 @@
 
 use core::future::Future;
 use core::marker::Send;
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 use core::pin::Pin;
 use core::time::Duration;
 #[cfg(feature = "__quic")]
@@ -317,6 +317,43 @@ where
     /// Send data to the given address.
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         poll_fn(|cx| self.poll_send_to(cx, buf, target)).await
+    }
+
+    /// Enable pktinfo socket options so that the destination address of incoming
+    /// packets is reported via [`poll_recv_from_with_dst`](Self::poll_recv_from_with_dst).
+    ///
+    /// Called automatically by [`UdpStream::with_bound`](crate::udp::UdpStream::with_bound)
+    /// for server-side sockets. The default implementation is a no-op.
+    fn enable_pktinfo(&self) {}
+
+    /// Like [`poll_recv_from`](Self::poll_recv_from), but also returns the local address
+    /// the packet was received on when pktinfo is available.
+    ///
+    /// The third element is `Some(ip)` when the socket has pktinfo enabled and the
+    /// platform supports it, otherwise `None`.
+    fn poll_recv_from_with_dst(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr, Option<IpAddr>)>> {
+        self.poll_recv_from(cx, buf)
+            .map(|r| r.map(|(n, src)| (n, src, None)))
+    }
+
+    /// Like [`poll_send_to`](Self::poll_send_to), but uses `local_ip` as the source
+    /// address when the platform supports it and `local_ip` is `Some`.
+    ///
+    /// Falls back to a plain `poll_send_to` when `local_ip` is `None` or the
+    /// platform does not support source address selection via pktinfo.
+    fn poll_send_to_with_src(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> Poll<io::Result<usize>> {
+        let _ = local_ip;
+        self.poll_send_to(cx, buf, target)
     }
 }
 

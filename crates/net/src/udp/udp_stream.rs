@@ -10,7 +10,11 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::collections::HashSet;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+#[cfg(all(feature = "tokio", unix))]
+use tokio::io::Interest;
 
 use async_trait::async_trait;
 use futures_util::{
@@ -124,6 +128,7 @@ impl<P: RuntimeProvider> UdpStream<P> {
     /// A tuple of a Stream which will handle sending and receiving messages, and a handle which can
     ///  be used to send messages into the stream.
     pub fn with_bound(socket: P::Udp, remote_addr: SocketAddr) -> (Self, BufDnsStreamHandle) {
+        socket.enable_pktinfo();
         let (message_sender, outbound_messages) = BufDnsStreamHandle::new(remote_addr);
         let stream = Self {
             socket,
@@ -161,12 +166,15 @@ impl<P: RuntimeProvider> Stream for UdpStream<P> {
         while let Poll::Ready(Some(message)) = outbound_messages.as_mut().poll_peek(cx) {
             // first try to send
             let addr = message.addr();
+            let local_ip = message.local_addr();
 
             // this will return if not ready,
             //   meaning that sending will be preferred over receiving...
 
             // TODO: shouldn't this return the error to send to the sender?
-            if let Err(e) = ready!(socket.poll_send_to(cx, message.bytes(), addr)) {
+            if let Err(e) =
+                ready!(socket.poll_send_to_with_src(cx, message.bytes(), addr, local_ip))
+            {
                 // Drop the UDP packet and continue
                 warn!(
                     "error sending message to {} on udp_socket, dropping response: {}",
@@ -183,9 +191,12 @@ impl<P: RuntimeProvider> Stream for UdpStream<P> {
 
         // TODO: this should match edns settings
         let mut buf = [0u8; MAX_RECEIVE_BUFFER_SIZE];
-        let (len, src) = ready!(socket.poll_recv_from(cx, &mut buf))?;
+        let (len, src, dst_ip) = ready!(socket.poll_recv_from_with_dst(cx, &mut buf))?;
 
-        let serial_message = SerialMessage::new(buf.iter().take(len).cloned().collect(), src);
+        let mut serial_message = SerialMessage::new(buf[..len].to_vec(), src);
+        if let Some(ip) = dst_ip {
+            serial_message.set_local_addr(ip);
+        }
         Poll::Ready(Some(Ok(serial_message)))
     }
 }
@@ -360,6 +371,369 @@ impl DnsUdpSocket for tokio::net::UdpSocket {
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         Self::poll_send_to(self, cx, buf, target)
+    }
+
+    #[cfg(unix)]
+    fn enable_pktinfo(&self) {
+        pktinfo::enable(self.as_raw_fd());
+    }
+
+    #[cfg(unix)]
+    fn poll_recv_from_with_dst(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<(usize, SocketAddr, Option<IpAddr>)>> {
+        loop {
+            ready!(self.poll_recv_ready(cx))?;
+            match self.try_io(Interest::READABLE, || pktinfo::recv(self.as_raw_fd(), buf)) {
+                Ok(result) => return Poll::Ready(Ok(result)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn poll_send_to_with_src(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+        local_ip: Option<IpAddr>,
+    ) -> Poll<io::Result<usize>> {
+        let Some(src_ip) = local_ip else {
+            return self.poll_send_to(cx, buf, target);
+        };
+        loop {
+            ready!(self.poll_send_ready(cx))?;
+            match self.try_io(Interest::WRITABLE, || {
+                pktinfo::send(self.as_raw_fd(), buf, target, src_ip)
+            }) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+/// Platform-specific pktinfo helpers for pinning UDP source addresses.
+///
+/// On Unix, DNS servers bound to `::` / `0.0.0.0` would otherwise let the
+/// kernel pick a source address for responses, which may differ from the
+/// address the client queried. Using `recvmsg`/`sendmsg` with pktinfo control
+/// messages ensures the response comes from the same address the query arrived at.
+#[cfg(all(feature = "tokio", unix))]
+mod pktinfo {
+    use core::mem::{self, size_of};
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::io;
+    use std::os::unix::io::RawFd;
+
+    /// Enable `IPV6_RECVPKTINFO` (and `IP_PKTINFO` on Linux) on the socket.
+    ///
+    /// Errors from setsockopt are intentionally ignored: the socket may be
+    /// IPv4-only (causing the IPv6 call to fail) or IPv6-only (causing the IPv4
+    /// call to fail). In either case the missing option simply means that family's
+    /// dst address will be unavailable, and the fallback is a regular sendto.
+    pub(super) fn enable(fd: RawFd) {
+        let one: libc::c_int = 1;
+        // Safety: fd comes from AsRawFd on a live socket and is valid for the duration of this call.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVPKTINFO,
+                (&one as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            #[cfg(target_os = "linux")]
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_PKTINFO,
+                (&one as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// Receive a UDP datagram via `recvmsg`, returning `(len, src, dst)`.
+    ///
+    /// `dst` is `Some` when a pktinfo control message is present (i.e. after
+    /// `enable` has been called on this socket).
+    pub(super) fn recv(
+        fd: RawFd,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+        // Safety: sockaddr_storage and msghdr are C structs with no invalid bit patterns; zeroed init is valid.
+        let mut src: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut cmsg_buf = [0u8; 256];
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = (&mut src as *mut libc::sockaddr_storage).cast();
+        msg.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1 as _;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg_buf.len() as _;
+
+        // Safety: fd is valid; msg points to live, correctly sized buffers set up above.
+        let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let src_addr = sockaddr_to_socket_addr(&src, msg.msg_namelen)?;
+        let dst_ip = parse_dst_from_cmsg(&msg);
+        Ok((n as usize, src_addr, dst_ip))
+    }
+
+    /// Send a UDP datagram via `sendmsg` with a pktinfo control message that
+    /// sets `src_ip` as the source address of the outgoing packet.
+    ///
+    /// Falls back to a plain `sendto` when the address families of `target`
+    /// and `src_ip` do not match.
+    pub(super) fn send(
+        fd: RawFd,
+        buf: &[u8],
+        target: SocketAddr,
+        src_ip: IpAddr,
+    ) -> io::Result<usize> {
+        match (target, src_ip) {
+            (SocketAddr::V6(dst), IpAddr::V6(src)) => send_v6(fd, buf, dst, src),
+            #[cfg(target_os = "linux")]
+            (SocketAddr::V4(dst), IpAddr::V4(src)) => send_v4(fd, buf, dst, src),
+            // Dual-stack: IPv4 client on an IPv6 socket. The target is an
+            // IPv4-mapped IPv6 address but pktinfo reported a plain IPv4 dst.
+            // Map the source to IPv6 so we can use IPV6_PKTINFO.
+            (SocketAddr::V6(dst), IpAddr::V4(src)) => send_v6(fd, buf, dst, src.to_ipv6_mapped()),
+            _ => send_plain(fd, buf, target),
+        }
+    }
+
+    fn send_v6(fd: RawFd, buf: &[u8], dst: SocketAddrV6, src: Ipv6Addr) -> io::Result<usize> {
+        let dst_sa = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as _,
+            sin6_port: dst.port().to_be(),
+            sin6_flowinfo: dst.flowinfo(),
+            sin6_addr: libc::in6_addr {
+                s6_addr: dst.ip().octets(),
+            },
+            sin6_scope_id: dst.scope_id(),
+        };
+        let pktinfo = libc::in6_pktinfo {
+            ipi6_addr: libc::in6_addr {
+                s6_addr: src.octets(),
+            },
+            ipi6_ifindex: 0,
+        };
+        let mut cmsg_buf = [0u8; 64];
+        let cmsg_space = unsafe { libc::CMSG_SPACE(size_of::<libc::in6_pktinfo>() as _) as usize };
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut _,
+            iov_len: buf.len(),
+        };
+        // Safety: msghdr is a C struct with no invalid bit patterns; zeroed init is valid.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = (&dst_sa as *const libc::sockaddr_in6).cast::<libc::c_void>() as *mut _;
+        msg.msg_namelen = size_of::<libc::sockaddr_in6>() as _;
+        msg.msg_iov = &iov as *const _ as *mut _;
+        msg.msg_iovlen = 1 as _;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg_space as _;
+
+        // Safety: msg_controllen == CMSG_SPACE(size_of::<in6_pktinfo>()) guarantees CMSG_FIRSTHDR is non-null.
+        // CMSG_DATA points into cmsg_buf, which is sized to hold exactly one in6_pktinfo.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+            (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as _) as _;
+            (libc::CMSG_DATA(cmsg) as *mut libc::in6_pktinfo).write(pktinfo);
+
+            let n = libc::sendmsg(fd, &msg, 0);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_v4(fd: RawFd, buf: &[u8], dst: SocketAddrV4, src: Ipv4Addr) -> io::Result<usize> {
+        let dst_sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as _,
+            sin_port: dst.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(dst.ip().octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        let pktinfo = libc::in_pktinfo {
+            ipi_ifindex: 0,
+            ipi_spec_dst: libc::in_addr {
+                s_addr: u32::from_ne_bytes(src.octets()),
+            },
+            ipi_addr: libc::in_addr { s_addr: 0 },
+        };
+        let mut cmsg_buf = [0u8; 64];
+        let cmsg_space = unsafe { libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as _) as usize };
+        let iov = libc::iovec {
+            iov_base: buf.as_ptr() as *mut _,
+            iov_len: buf.len(),
+        };
+        // Safety: msghdr is a C struct with no invalid bit patterns; zeroed init is valid.
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = (&dst_sa as *const libc::sockaddr_in).cast::<libc::c_void>() as *mut _;
+        msg.msg_namelen = size_of::<libc::sockaddr_in>() as _;
+        msg.msg_iov = &iov as *const _ as *mut _;
+        msg.msg_iovlen = 1 as _;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+        msg.msg_controllen = cmsg_space as _;
+
+        // Safety: msg_controllen == CMSG_SPACE(size_of::<in_pktinfo>()) guarantees CMSG_FIRSTHDR is non-null.
+        // CMSG_DATA points into cmsg_buf, which is sized to hold exactly one in_pktinfo.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::IPPROTO_IP;
+            (*cmsg).cmsg_type = libc::IP_PKTINFO;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as _) as _;
+            (libc::CMSG_DATA(cmsg) as *mut libc::in_pktinfo).write(pktinfo);
+
+            let n = libc::sendmsg(fd, &msg, 0);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        }
+    }
+
+    /// Plain sendto without pktinfo. Used when source address pinning is not
+    /// possible (e.g. mismatched address families on non-Linux).
+    fn send_plain(fd: RawFd, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        // Safety: sockaddr structs live on the stack for the duration of sendto.
+        let n = unsafe {
+            match target {
+                SocketAddr::V4(v4) => {
+                    let dst_sa = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as _,
+                        sin_port: v4.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    libc::sendto(
+                        fd,
+                        buf.as_ptr().cast(),
+                        buf.len(),
+                        0,
+                        (&dst_sa as *const libc::sockaddr_in).cast(),
+                        size_of::<libc::sockaddr_in>() as _,
+                    )
+                }
+                SocketAddr::V6(v6) => {
+                    let dst_sa = libc::sockaddr_in6 {
+                        sin6_family: libc::AF_INET6 as _,
+                        sin6_port: v6.port().to_be(),
+                        sin6_flowinfo: v6.flowinfo(),
+                        sin6_addr: libc::in6_addr {
+                            s6_addr: v6.ip().octets(),
+                        },
+                        sin6_scope_id: v6.scope_id(),
+                    };
+                    libc::sendto(
+                        fd,
+                        buf.as_ptr().cast(),
+                        buf.len(),
+                        0,
+                        (&dst_sa as *const libc::sockaddr_in6).cast(),
+                        size_of::<libc::sockaddr_in6>() as _,
+                    )
+                }
+            }
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    fn parse_dst_from_cmsg(msg: &libc::msghdr) -> Option<IpAddr> {
+        // Safety: msg was filled by recvmsg; msg_control and msg_controllen are valid.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+            while !cmsg.is_null() {
+                let hdr = &*cmsg;
+                if hdr.cmsg_level == libc::IPPROTO_IPV6 as _
+                    && hdr.cmsg_type == libc::IPV6_PKTINFO as _
+                    && hdr.cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as _) as _
+                {
+                    let info = &*(libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo);
+                    return Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
+                }
+                #[cfg(target_os = "linux")]
+                if hdr.cmsg_level == libc::IPPROTO_IP as _
+                    && hdr.cmsg_type == libc::IP_PKTINFO as _
+                    && hdr.cmsg_len >= libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as _) as _
+                {
+                    let info = &*(libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo);
+                    return Some(IpAddr::V4(Ipv4Addr::from(
+                        info.ipi_addr.s_addr.to_ne_bytes(),
+                    )));
+                }
+                cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            }
+        }
+        None
+    }
+
+    fn sockaddr_to_socket_addr(
+        storage: &libc::sockaddr_storage,
+        len: libc::socklen_t,
+    ) -> io::Result<SocketAddr> {
+        match storage.ss_family as libc::c_int {
+            libc::AF_INET => {
+                if (len as usize) < size_of::<libc::sockaddr_in>() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IPv4 sockaddr too short",
+                    ));
+                }
+                // Safety: ss_family == AF_INET guarantees the union holds a sockaddr_in.
+                let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+                Ok(SocketAddr::V4(SocketAddrV4::new(
+                    // s_addr bytes in memory are network byte order; read them directly.
+                    Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(addr.sin_port),
+                )))
+            }
+            libc::AF_INET6 => {
+                if (len as usize) < size_of::<libc::sockaddr_in6>() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IPv6 sockaddr too short",
+                    ));
+                }
+                // Safety: ss_family == AF_INET6 guarantees the union holds a sockaddr_in6.
+                let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                    u16::from_be(addr.sin6_port),
+                    addr.sin6_flowinfo,
+                    addr.sin6_scope_id,
+                )))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported address family in recvmsg",
+            )),
+        }
     }
 }
 
