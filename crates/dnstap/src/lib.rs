@@ -59,6 +59,33 @@
 //! log_client_query = true
 //! log_client_response = true
 //! ```
+//!
+//! # Metrics
+//!
+//! With the `metrics` feature enabled, the layer and [`DnstapClient`] export
+//! the DNSTAP pipeline through the `metrics` crate:
+//!
+//! - `hickory_dnstap_sent_events_total` and `hickory_dnstap_dropped_events_total`,
+//!   labeled by `category` (auth, client, resolver, update) and `direction`
+//!   (query, response); drops also carry a `reason` of `buffer_full` or
+//!   `write_failed`.
+//! - `hickory_dnstap_filtered_events_total` for events the `log_*` flags
+//!   discarded before buffering.
+//! - `hickory_dnstap_sent_bytes_total` for delivered payload bytes, and
+//!   `hickory_dnstap_batch_flush_duration_seconds` for how long the writer
+//!   blocked on the collector.
+//! - `hickory_dnstap_buffer_events` and `hickory_dnstap_buffer_bytes` gauges
+//!   against `hickory_dnstap_buffer_max_events_total` and
+//!   `hickory_dnstap_buffer_max_bytes_total`, the bounds `buffer_size`
+//!   sets. The max counters are written once when the sender starts, so
+//!   their `rate()` is always zero. Buffer memory is also bounded by
+//!   [`QUEUED_BYTES_PER_EVENT`].
+//! - `hickory_dnstap_collector_session_up`, `hickory_dnstap_session_reconnects_total`
+//!   and `hickory_dnstap_reconnect_backoff_seconds` for the state of the
+//!   collector session.
+//!
+//! Install the metrics recorder before [`DnstapConnection::start`] or
+//! [`DnstapClient::new`]: handles bound before a recorder exists never report.
 
 #![warn(clippy::dbg_macro, clippy::print_stdout, missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
@@ -68,6 +95,8 @@ mod dnstap_message;
 mod event;
 mod framestream;
 mod layer;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 
 pub use client::{
     DnstapClient, DnstapConfig, DnstapConnection, DnstapEndpoint, QUEUED_BYTES_PER_EVENT,
