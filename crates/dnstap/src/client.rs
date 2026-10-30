@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+#[cfg(feature = "metrics")]
+use std::time::Instant;
 
 #[cfg(test)]
 use bytes::Bytes;
@@ -20,6 +22,8 @@ use crate::DnsTransport;
 use crate::dnstap_message;
 use crate::event::{DnstapEvent, DnstapMessageType, EventPayload};
 use crate::framestream::{self, EncoderConfig, FrameStreamCodec, FrameStreamItem};
+#[cfg(feature = "metrics")]
+use crate::metrics::{BatchCounts, DnstapMetrics, DropReason};
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -250,6 +254,8 @@ pub(crate) struct EventQueue {
     filter: MessageTypeFilter,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
+    #[cfg(feature = "metrics")]
+    metrics: DnstapMetrics,
 }
 
 impl EventQueue {
@@ -268,15 +274,27 @@ impl EventQueue {
             filter,
             drop_count: Arc::clone(&connection.drop_count),
             budget: Arc::clone(&connection.budget),
+            #[cfg(feature = "metrics")]
+            metrics: connection.metrics.clone(),
         };
         (queue, connection)
     }
 
     pub(crate) fn send(&self, event: DnstapEvent) {
         if !self.filter.allows(event.message_type, event.is_query()) {
+            #[cfg(feature = "metrics")]
+            self.metrics
+                .increment_filtered(event.message_type, event.is_query());
             return;
         }
-        enqueue(&self.sender, &self.budget, &self.drop_count, event);
+        enqueue(
+            &self.sender,
+            &self.budget,
+            &self.drop_count,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+            event,
+        );
     }
 
     /// Queue over an existing channel, for tests that read the events.
@@ -286,11 +304,20 @@ impl EventQueue {
         filter: MessageTypeFilter,
     ) -> Self {
         let budget = Arc::new(ByteBudget::for_buffer(sender.max_capacity()));
+        #[cfg(feature = "metrics")]
+        let metrics = {
+            // Tests install their recorder before building the queue.
+            let metrics = DnstapMetrics::default();
+            metrics.init(sender.max_capacity(), budget.limit);
+            metrics
+        };
         Self {
             sender,
             filter,
             drop_count: Arc::new(AtomicU64::new(0)),
             budget,
+            #[cfg(feature = "metrics")]
+            metrics,
         }
     }
 }
@@ -329,9 +356,14 @@ impl ByteBudget {
         self.events.fetch_sub(1, Ordering::AcqRel);
     }
 
-    #[cfg(test)]
+    #[cfg(any(feature = "metrics", test))]
     fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "metrics")]
+    fn events(&self) -> usize {
+        self.events.load(Ordering::Acquire)
     }
 }
 
@@ -339,17 +371,28 @@ pub(crate) fn enqueue(
     sender: &mpsc::Sender<DnstapEvent>,
     budget: &ByteBudget,
     drop_count: &AtomicU64,
+    #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
     event: DnstapEvent,
 ) {
     let len = event.payload_len();
+    #[cfg(feature = "metrics")]
+    let message_type = event.message_type;
+    #[cfg(feature = "metrics")]
+    let query = event.is_query();
 
     if budget.try_reserve(len) {
         if sender.try_send(event).is_ok() {
+            // Refreshed here as well as in the drain loop so the gauges keep
+            // tracking occupancy while the sender is reconnecting.
+            #[cfg(feature = "metrics")]
+            metrics.set_buffer(budget.events(), budget.bytes());
             return;
         }
         budget.release(len);
     }
     drop_count.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "metrics")]
+    metrics.increment_dropped(message_type, query, DropReason::BufferFull);
 }
 
 /// Create the mpsc channel for the DNSTAP background sender.
@@ -376,6 +419,8 @@ pub(crate) fn create_background_sender(
         drop_count: Arc::clone(&drop_count),
         budget: Arc::new(ByteBudget::for_buffer(buffer_size)),
         encoder: EncoderConfig { identity, version },
+        #[cfg(feature = "metrics")]
+        metrics: DnstapMetrics::default(),
     };
     (sender, conn)
 }
@@ -392,6 +437,8 @@ pub struct DnstapConnection {
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
     encoder: EncoderConfig,
+    #[cfg(feature = "metrics")]
+    metrics: DnstapMetrics,
 }
 
 impl DnstapConnection {
@@ -399,7 +446,13 @@ impl DnstapConnection {
     ///
     /// The task connects to the DNSTAP endpoint, performs the Frame Streams
     /// handshake, and begins draining queued frames.
+    ///
+    /// Registers the metrics handles, so the recorder must exist by now.
     pub fn start(self) {
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .init(self.receiver.max_capacity(), self.budget.limit);
+
         tokio::spawn(background_sender(
             self.endpoint,
             self.max_backoff,
@@ -407,6 +460,8 @@ impl DnstapConnection {
             self.drop_count,
             self.budget,
             self.encoder,
+            #[cfg(feature = "metrics")]
+            self.metrics,
         ));
     }
 }
@@ -418,6 +473,7 @@ async fn background_sender(
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
     enc: EncoderConfig,
+    #[cfg(feature = "metrics")] metrics: DnstapMetrics,
 ) {
     let mut backoff = INITIAL_BACKOFF;
 
@@ -435,8 +491,14 @@ async fn background_sender(
             &budget,
             enc.clone(),
             &mut backoff,
+            #[cfg(feature = "metrics")]
+            &metrics,
         )
         .await;
+        // Outside the match arms, so the shutdown path also reports the
+        // session down.
+        #[cfg(feature = "metrics")]
+        metrics.set_collector_session_up(false);
         match result {
             Ok(()) => {
                 info!("dnstap client shutting down");
@@ -444,6 +506,11 @@ async fn background_sender(
             }
             Err(e) => {
                 error!("dnstap connection error: {e}, reconnecting in {backoff:?}");
+                #[cfg(feature = "metrics")]
+                {
+                    metrics.increment_session_reconnect();
+                    metrics.set_reconnect_backoff(backoff);
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
@@ -458,18 +525,39 @@ async fn connect_and_send(
     budget: &ByteBudget,
     enc: EncoderConfig,
     backoff: &mut Duration,
+    #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match endpoint {
         DnstapEndpoint::Tcp(addr) => {
             debug!("dnstap connecting to TCP {addr}");
             let stream = tokio::net::TcpStream::connect(addr).await?;
-            run_stream(stream, receiver, drop_count, budget, enc, backoff).await
+            run_stream(
+                stream,
+                receiver,
+                drop_count,
+                budget,
+                enc,
+                backoff,
+                #[cfg(feature = "metrics")]
+                metrics,
+            )
+            .await
         }
         #[cfg(unix)]
         DnstapEndpoint::Unix(path) => {
             debug!("dnstap connecting to Unix socket {}", path.display());
             let stream = tokio::net::UnixStream::connect(path).await?;
-            run_stream(stream, receiver, drop_count, budget, enc, backoff).await
+            run_stream(
+                stream,
+                receiver,
+                drop_count,
+                budget,
+                enc,
+                backoff,
+                #[cfg(feature = "metrics")]
+                metrics,
+            )
+            .await
         }
     }
 }
@@ -487,6 +575,7 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
     budget: &ByteBudget,
     enc: EncoderConfig,
     backoff: &mut Duration,
+    #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut framed = Framed::new(stream, FrameStreamCodec::with_encoder(enc));
 
@@ -542,6 +631,11 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
     // The collector was just reachable, so restart the backoff sequence.
     *backoff = INITIAL_BACKOFF;
+    #[cfg(feature = "metrics")]
+    {
+        metrics.set_collector_session_up(true);
+        metrics.set_reconnect_backoff(Duration::ZERO);
+    }
 
     let dropped = drop_count.swap(0, Ordering::Relaxed);
     if dropped > 0 {
@@ -559,7 +653,11 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
             msg = receiver.recv() => {
                 let Some(event) = msg else { break; };
                 budget.release(event.payload_len());
-                send_event_batch(&mut sink, event, receiver, drop_count, budget).await?;
+                send_event_batch(&mut sink, event, receiver, drop_count, budget, #[cfg(feature = "metrics")] metrics).await?;
+                // After the batch, so an idle queue reads zero instead of the
+                // depth of the last burst.
+                #[cfg(feature = "metrics")]
+                metrics.set_buffer(budget.events(), budget.bytes());
             }
             frame = collector.next() => {
                 match frame {
@@ -632,12 +730,22 @@ async fn send_event_batch<S>(
     receiver: &mut mpsc::Receiver<DnstapEvent>,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
+    #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Sink<FrameStreamItem, Error = io::Error> + Unpin,
 {
     // Events in this batch, for the drop count when the write fails.
     let mut events = 1usize;
+    // Category and direction of the batch, for the counters.
+    #[cfg(feature = "metrics")]
+    let mut counts = BatchCounts::default();
+    #[cfg(feature = "metrics")]
+    counts.add(first.message_type, first.is_query());
+    #[cfg(feature = "metrics")]
+    let mut bytes = first.payload_len();
+    #[cfg(feature = "metrics")]
+    let write_started = Instant::now();
 
     let result = async {
         sink.feed(FrameStreamItem::Event(first)).await?;
@@ -647,6 +755,11 @@ where
             let len = next.payload_len();
             budget.release(len);
             events += 1;
+            #[cfg(feature = "metrics")]
+            {
+                bytes += len;
+                counts.add(next.message_type, next.is_query());
+            }
             sink.feed(FrameStreamItem::Event(next)).await?;
         }
         sink.flush().await
@@ -654,9 +767,19 @@ where
     .await;
 
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(feature = "metrics")]
+            {
+                metrics.add_sent_bytes(bytes);
+                metrics.observe_batch_flush_duration(write_started.elapsed());
+                metrics.increment_sent_batch(&counts);
+            }
+            Ok(())
+        }
         Err(e) => {
             drop_count.fetch_add(events as u64, Ordering::Relaxed);
+            #[cfg(feature = "metrics")]
+            metrics.increment_dropped_batch(&counts, DropReason::WriteFailed);
             Err(e.into())
         }
     }
@@ -756,6 +879,335 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_channel_drop_increments_dropped_counter() {
+        use metrics::{Label, with_local_recorder};
+        use metrics_util::debugging::DebuggingRecorder;
+        use test_support::assert_counter_eq;
+
+        use crate::metrics::{DROPPED_EVENTS_TOTAL, SENT_EVENTS_TOTAL};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let (sender, _receiver) = mpsc::channel(1);
+            let client = new_with_sender(sender);
+
+            client.log_query(
+                DnstapMessageType::Auth,
+                Some("127.0.0.1:1234".parse().unwrap()),
+                None,
+                Some(DnsTransport::Udp),
+                b"\x00\x01",
+            );
+            // Channel is full; this one is dropped.
+            client.log_query(
+                DnstapMessageType::Auth,
+                Some("127.0.0.1:1234".parse().unwrap()),
+                None,
+                Some(DnsTransport::Udp),
+                b"\x00\x02",
+            );
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+
+        let labels = |direction, reason| {
+            vec![
+                Label::new("category", "auth"),
+                Label::new("direction", direction),
+                Label::new("reason", reason),
+            ]
+        };
+        // Without a background task nothing drains the channel, so nothing is
+        // counted as sent.
+        assert_counter_eq(
+            &map,
+            SENT_EVENTS_TOTAL,
+            vec![
+                Label::new("category", "auth"),
+                Label::new("direction", "query"),
+            ],
+            0,
+        );
+        assert_counter_eq(
+            &map,
+            DROPPED_EVENTS_TOTAL,
+            labels("query", "buffer_full"),
+            1,
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_run_stream_increments_sent_counter() {
+        use metrics::{Label, with_local_recorder};
+        use metrics_util::debugging::DebuggingRecorder;
+        use test_support::assert_counter_eq;
+
+        use crate::metrics::SENT_EVENTS_TOTAL;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (sender, mut receiver) = mpsc::channel(8);
+                sender
+                    .send(DnstapEvent {
+                        message_type: DnstapMessageType::Auth,
+                        src_addr: Some("127.0.0.1:1234".parse().unwrap()),
+                        server_addr: None,
+                        transport: Some(DnsTransport::Udp),
+                        query_zone: None,
+                        query_time: (1_000_000, 0),
+                        payload: EventPayload::Query {
+                            bytes: b"\x00\x01".to_vec(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                drop(sender);
+
+                let (client_side, server_side) = duplex(4096);
+                let mut server = Framed::new(server_side, FrameStreamCodec::new());
+                let server = tokio::spawn(async move {
+                    mock_handshake(&mut server).await.unwrap();
+
+                    let data = server.next().await.unwrap().unwrap();
+                    assert!(
+                        matches!(&data, FrameStreamItem::Data(payload) if !payload.is_empty()),
+                        "expected a data frame, got {data:?}"
+                    );
+
+                    let stop = server.next().await.unwrap().unwrap();
+                    assert!(
+                        matches!(
+                            stop,
+                            FrameStreamItem::Control {
+                                control_type: CONTROL_STOP,
+                                ..
+                            }
+                        ),
+                        "expected STOP, got {stop:?}"
+                    );
+                    server
+                        .send(FrameStreamItem::bare_control(CONTROL_FINISH))
+                        .await
+                        .unwrap();
+                });
+
+                run_test_stream(client_side, &mut receiver).await.unwrap();
+
+                server.await.unwrap();
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+        let labels = vec![
+            Label::new("category", "auth"),
+            Label::new("direction", "query"),
+        ];
+        assert_counter_eq(&map, SENT_EVENTS_TOTAL, labels, 1);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_coalesced_batch_counts_every_event() {
+        use metrics::{Label, with_local_recorder};
+        use metrics_util::debugging::DebuggingRecorder;
+        use test_support::assert_counter_eq;
+
+        use crate::metrics::SENT_EVENTS_TOTAL;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                // Both events are queued before the sender starts, so they
+                // are written by one flush.
+                let (sender, mut receiver) = mpsc::channel(8);
+                for (message_type, query) in [
+                    (DnstapMessageType::Auth, true),
+                    (DnstapMessageType::Client, false),
+                ] {
+                    sender
+                        .send(DnstapEvent {
+                            message_type,
+                            src_addr: Some("127.0.0.1:1234".parse().unwrap()),
+                            server_addr: None,
+                            transport: Some(DnsTransport::Udp),
+                            query_zone: None,
+                            query_time: (1_000_000, 0),
+                            payload: if query {
+                                EventPayload::Query {
+                                    bytes: b"\x00\x01".to_vec(),
+                                }
+                            } else {
+                                EventPayload::Response {
+                                    bytes: b"\x00\x01".to_vec(),
+                                    response_time: (1_000_000, 0),
+                                }
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                drop(sender);
+
+                let (client_side, server_side) = duplex(4096);
+                let mut server = Framed::new(server_side, FrameStreamCodec::new());
+                let server = tokio::spawn(async move {
+                    mock_handshake(&mut server).await.unwrap();
+
+                    for _ in 0..2 {
+                        let data = server.next().await.unwrap().unwrap();
+                        assert!(
+                            matches!(&data, FrameStreamItem::Data(payload) if !payload.is_empty()),
+                            "expected a data frame, got {data:?}"
+                        );
+                    }
+
+                    let stop = server.next().await.unwrap().unwrap();
+                    assert!(
+                        matches!(
+                            stop,
+                            FrameStreamItem::Control {
+                                control_type: CONTROL_STOP,
+                                ..
+                            }
+                        ),
+                        "expected STOP, got {stop:?}"
+                    );
+                    server
+                        .send(FrameStreamItem::bare_control(CONTROL_FINISH))
+                        .await
+                        .unwrap();
+                });
+
+                run_test_stream(client_side, &mut receiver).await.unwrap();
+
+                server.await.unwrap();
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+        assert_counter_eq(
+            &map,
+            SENT_EVENTS_TOTAL,
+            vec![
+                Label::new("category", "auth"),
+                Label::new("direction", "query"),
+            ],
+            1,
+        );
+        assert_counter_eq(
+            &map,
+            SENT_EVENTS_TOTAL,
+            vec![
+                Label::new("category", "client"),
+                Label::new("direction", "response"),
+            ],
+            1,
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_write_failure_counts_dropped_as_write_failed() {
+        use metrics::{Label, with_local_recorder};
+        use metrics_util::debugging::DebuggingRecorder;
+        use test_support::assert_counter_eq;
+
+        use crate::metrics::{DROPPED_EVENTS_TOTAL, SENT_EVENTS_TOTAL};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                // A sink whose collector half is already gone: the flush fails
+                // with the batch still in hand.
+                let (client_side, server_side) = duplex(4096);
+                drop(server_side);
+                let mut sink = Framed::new(
+                    client_side,
+                    FrameStreamCodec::with_encoder(EncoderConfig::default()),
+                );
+
+                let (_sender, mut receiver) = mpsc::channel(8);
+                let budget = ByteBudget::for_buffer(receiver.max_capacity());
+                let drop_count = AtomicU64::new(0);
+                let metrics = DnstapMetrics::default();
+                metrics.init(receiver.max_capacity(), budget.limit);
+
+                let event = DnstapEvent {
+                    message_type: DnstapMessageType::Auth,
+                    src_addr: None,
+                    server_addr: None,
+                    transport: None,
+                    query_zone: None,
+                    query_time: (1_000_000, 0),
+                    payload: EventPayload::Query {
+                        bytes: b"\x00\x01".to_vec(),
+                    },
+                };
+
+                let result = send_event_batch(
+                    &mut sink,
+                    event,
+                    &mut receiver,
+                    &drop_count,
+                    &budget,
+                    #[cfg(feature = "metrics")]
+                    &metrics,
+                )
+                .await;
+                assert!(result.is_err(), "a closed collector must fail the write");
+            });
+        });
+
+        #[allow(clippy::mutable_key_type)]
+        let map = snapshotter.snapshot().into_hashmap();
+        assert_counter_eq(
+            &map,
+            DROPPED_EVENTS_TOTAL,
+            vec![
+                Label::new("category", "auth"),
+                Label::new("direction", "query"),
+                Label::new("reason", "write_failed"),
+            ],
+            1,
+        );
+        assert_counter_eq(
+            &map,
+            SENT_EVENTS_TOTAL,
+            vec![
+                Label::new("category", "auth"),
+                Label::new("direction", "query"),
+            ],
+            0,
+        );
+    }
+
     #[tokio::test]
     async fn test_collector_stop_closes_stream() {
         // The sender stays open for the whole test, so the session can only
@@ -850,15 +1302,21 @@ mod tests {
                 &task_budget,
                 enc,
                 &mut backoff,
+                #[cfg(feature = "metrics")]
+                &DnstapMetrics::default(),
             )
             .await
         });
 
+        #[cfg(feature = "metrics")]
+        let metrics = DnstapMetrics::default();
         for _ in 0..EVENTS {
             enqueue(
                 &sender,
                 &budget,
                 &drop_count,
+                #[cfg(feature = "metrics")]
+                &metrics,
                 DnstapEvent {
                     message_type: DnstapMessageType::Auth,
                     src_addr: None,
@@ -1014,6 +1472,8 @@ mod tests {
             Arc::clone(&drop_count),
             Arc::new(ByteBudget::for_buffer(8)),
             enc,
+            #[cfg(feature = "metrics")]
+            DnstapMetrics::default(),
         );
 
         tokio::time::timeout(Duration::from_secs(5), sender_loop)
@@ -1131,6 +1591,34 @@ mod tests {
         Ok(())
     }
 
+    /// Run `run_stream` over a stream with the default test configuration.
+    #[cfg(feature = "metrics")]
+    async fn run_test_stream(
+        client_side: impl AsyncRead + AsyncWrite + Unpin,
+        receiver: &mut mpsc::Receiver<DnstapEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let enc = EncoderConfig {
+            identity: Arc::new(None),
+            version: Arc::new(None),
+        };
+        let budget = ByteBudget::for_buffer(receiver.max_capacity());
+        let mut backoff = INITIAL_BACKOFF;
+        let metrics = DnstapMetrics::default();
+        metrics.init(receiver.max_capacity(), budget.limit);
+        run_stream(
+            client_side,
+            receiver,
+            &drop_count,
+            &budget,
+            enc,
+            &mut backoff,
+            &metrics,
+        )
+        .await
+    }
+
+    #[cfg(not(feature = "metrics"))]
     async fn run_test_stream(
         client_side: impl AsyncRead + AsyncWrite + Unpin,
         receiver: &mut mpsc::Receiver<DnstapEvent>,
