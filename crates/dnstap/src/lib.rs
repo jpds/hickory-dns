@@ -19,17 +19,21 @@
 //!
 //! # Per-message-type logging
 //!
-//! Following the Unbound-style model, each combination of message category and direction
-//! can be independently enabled or disabled. The six supported message types are:
+//! Each combination of message category and direction is toggled by its own flag.
+//! The ten supported message types are:
 //!
-//! | Config option            | Description                          |
-//! |--------------------------|--------------------------------------|
-//! | `log_auth_query`         | Authoritative queries received       |
-//! | `log_auth_response`      | Authoritative responses sent         |
-//! | `log_client_query`       | Client queries received              |
-//! | `log_client_response`    | Client responses sent                |
-//! | `log_resolver_query`     | Outbound resolver queries            |
-//! | `log_resolver_response`  | Inbound resolver responses           |
+//! | Config option              | Description                                    |
+//! |----------------------------|------------------------------------------------|
+//! | `log_auth_query`           | Authoritative queries received                 |
+//! | `log_auth_response`        | Authoritative responses sent                   |
+//! | `log_client_query`         | Client queries received                        |
+//! | `log_client_response`      | Client responses sent                          |
+//! | `log_resolver_query`       | Recursor queries sent upstream                 |
+//! | `log_resolver_response`    | Recursor responses received from upstream      |
+//! | `log_forwarder_query`      | Forwarded queries sent to an upstream resolver |
+//! | `log_forwarder_response`   | Forwarded responses received from an upstream  |
+//! | `log_update_query`         | Dynamic update requests received               |
+//! | `log_update_response`      | Dynamic update responses sent                  |
 //!
 //! All default to `false`.
 //!
@@ -51,10 +55,14 @@
 #![warn(clippy::dbg_macro, clippy::print_stdout, missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod client;
 mod dnstap_message;
 mod event;
 mod framestream;
 
+pub use client::{
+    DnstapClient, DnstapConfig, DnstapConnection, DnstapEndpoint, QUEUED_BYTES_PER_EVENT,
+};
 pub use event::DnstapMessageType;
 
 /// DNS transport protocol for the DNSTAP `socket_protocol` field.
