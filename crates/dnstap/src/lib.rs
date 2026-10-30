@@ -53,6 +53,7 @@
 
 mod dnstap_message;
 mod event;
+mod framestream;
 
 pub use event::DnstapMessageType;
 
