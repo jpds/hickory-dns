@@ -407,6 +407,12 @@ fn test_reject_unknown_fields() {
             skip = true;
         }
 
+        #[cfg(not(feature = "dnstap"))]
+        if config_table.contains_key("dnstap") {
+            println!("skipping due to dnstap setting");
+            skip = true;
+        }
+
         if file_name.starts_with("example_recursor_opportunistic_enc") {
             // The opportunistic encryption enum doesn't work with this test. There's no
             // serde equivalent to deny_unknown_fields that works for enums - it's specific
