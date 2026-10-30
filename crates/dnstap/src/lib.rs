@@ -45,6 +45,11 @@
 //!
 //! All default to `false`.
 //!
+//! Note on upstream traffic: outbound recursor hops and their responses are
+//! recorded as `log_resolver_*` events; forwarded requests are not emitted, and
+//! the forwarder-specific FQ/FR message types are not generated. Authoritative
+//! response frames carry the answering zone as the bailiwick (`query_zone`).
+//!
 //! # Configuration example
 //!
 //! ```toml
