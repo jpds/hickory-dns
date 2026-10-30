@@ -51,6 +51,10 @@
 #![warn(clippy::dbg_macro, clippy::print_stdout, missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod event;
+
+pub use event::DnstapMessageType;
+
 /// DNS transport protocol for the DNSTAP `socket_protocol` field.
 ///
 /// This is a simplified protocol enum that decouples the DNSTAP crate from
