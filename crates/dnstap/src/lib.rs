@@ -20,7 +20,7 @@
 //! # Per-message-type logging
 //!
 //! Following the Unbound-style model, each combination of message category and direction
-//! can be independently enabled or disabled. The six supported message types are:
+//! can be independently enabled or disabled. The eight supported message types are:
 //!
 //! | Config option            | Description                          |
 //! |--------------------------|--------------------------------------|
@@ -30,6 +30,8 @@
 //! | `log_client_response`    | Client responses sent                |
 //! | `log_resolver_query`     | Outbound resolver queries            |
 //! | `log_resolver_response`  | Inbound resolver responses           |
+//! | `log_update_query`       | Dynamic update requests received     |
+//! | `log_update_response`    | Dynamic update responses sent        |
 //!
 //! All default to `false`.
 //!
@@ -51,10 +53,14 @@
 #![warn(clippy::dbg_macro, clippy::print_stdout, missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod client;
 mod dnstap_message;
 mod event;
 mod framestream;
 
+pub use client::{
+    DnstapClient, DnstapConfig, DnstapConnection, DnstapEndpoint, QUEUED_BYTES_PER_EVENT,
+};
 pub use event::DnstapMessageType;
 
 /// DNS transport protocol for the DNSTAP `socket_protocol` field.
