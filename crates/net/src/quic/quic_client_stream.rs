@@ -21,6 +21,7 @@ use quinn::{
     ClientConfig, Connection, Endpoint, TransportConfig, VarInt, crypto::rustls::QuicClientConfig,
 };
 use tokio::time::timeout;
+use tracing::Instrument;
 
 use crate::{
     error::NetError,
@@ -168,7 +169,11 @@ impl DnsRequestSender for QuicClientStream {
             panic!("can not send messages after stream is shutdown")
         }
 
-        Box::pin(Self::inner_send(self.quic_connection.clone(), request)).into()
+        // Serialization happens when the send future is polled, so carry the
+        // request span to it rather than relying on the send call's scope.
+        let send = Self::inner_send(self.quic_connection.clone(), request)
+            .instrument(tracing::Span::current());
+        Box::pin(send).into()
     }
 
     fn shutdown(&mut self) {

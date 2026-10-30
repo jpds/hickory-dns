@@ -21,7 +21,7 @@ use tracing::debug;
 
 use crate::error::NetError;
 use crate::proto::op::{DnsRequest, DnsResponse};
-use crate::xfer::DnsResponseStream;
+use crate::xfer::{DnsResponseStream, emit_query_frame};
 
 pub(crate) struct RequestContext {
     pub(crate) version: Version,
@@ -108,6 +108,9 @@ pub(crate) trait HttpSender: Clone + Send + 'static {
             Ok(bytes) => Bytes::from(bytes),
             Err(err) => return NetError::from(err).into(),
         };
+
+        // The request object does not know the connection's local endpoint.
+        emit_query_frame(&bytes, None);
 
         let request = match self.context().build(bytes.remaining()) {
             Ok(request) => request,

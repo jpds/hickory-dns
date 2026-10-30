@@ -176,13 +176,17 @@ impl<S: DnsRequestSender, TE: Time> Future for DnsExchangeBackground<S, TE> {
                 // already handled above, here to make sure the poll() pops the next message
                 Poll::Ready(Some(dns_request)) => {
                     // if there is no peer, this connection should die...
-                    let (dns_request, serial_response): (DnsRequest, _) = dns_request.into_parts();
+                    let (dns_request, span, serial_response) = dns_request.into_parts();
+
+                    // The span is entered for the send, so a transport that
+                    // serializes the message there records against this request.
+                    let response_stream = span.in_scope(|| io_stream.send_message(dns_request));
 
                     // Try to forward the `DnsResponseStream` to the requesting task. If we fail,
                     // it must be because the requesting task has gone away / is no longer
                     // interested. In that case, we can just log a warning, but there's no need
                     // to take any more serious measures (such as shutting down this task).
-                    match serial_response.send_response(io_stream.send_message(dns_request)) {
+                    match serial_response.send_response(response_stream) {
                         Ok(()) => (),
                         Err(_) => {
                             debug!("failed to associate send_message response to the sender");

@@ -325,6 +325,14 @@ where
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         poll_fn(|cx| self.poll_send_to(cx, buf, target)).await
     }
+
+    /// Local endpoint this socket sends from, recorded as the initiator of an upstream query.
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "socket does not report its local endpoint",
+        ))
+    }
 }
 
 /// Noop trait for when the `quinn` dependency is not available.

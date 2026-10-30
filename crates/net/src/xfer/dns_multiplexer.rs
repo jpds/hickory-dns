@@ -25,7 +25,8 @@ use rand::RngExt;
 use tracing::debug;
 
 use super::{
-    BufDnsStreamHandle, DnsClientStream, DnsRequestSender, DnsResponseStream, ignore_send,
+    BufDnsStreamHandle, DnsClientStream, DnsRequestSender, DnsResponseStream, emit_query_frame,
+    ignore_send,
 };
 use crate::proto::op::{DnsRequest, DnsResponse, SerialMessage};
 #[cfg(feature = "__dnssec")]
@@ -248,6 +249,9 @@ impl<S: DnsClientStream> DnsRequestSender for DnsMultiplexer<S> {
 
         match request.to_vec() {
             Ok(buffer) => {
+                // A connected stream does not expose its local endpoint, so no initiator
+                // is recorded for TCP or TLS queries.
+                emit_query_frame(&buffer, None);
                 debug!(id = %active_request.request_id(), "sending message");
                 let serial_message = SerialMessage::new(buffer, self.stream.name_server_addr());
 

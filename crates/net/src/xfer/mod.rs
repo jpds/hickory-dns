@@ -8,7 +8,7 @@ use core::fmt::Display;
 use core::fmt::{self, Debug};
 use core::future::Future;
 use core::marker::PhantomData;
-use core::net::SocketAddr;
+use core::net::{IpAddr, SocketAddr};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -281,6 +281,9 @@ impl<P> BufDnsRequestStreamHandle<P> {
 /// A OneshotDnsRequest creates a channel for a response to message
 pub struct OneshotDnsRequest {
     dns_request: DnsRequest,
+    /// Span active when the request was enqueued, so a transport that emits at
+    /// send time records the enqueueing task's DNSTAP context.
+    span: tracing::Span,
     sender_for_response: oneshot::Sender<DnsResponseStream>,
 }
 
@@ -291,21 +294,65 @@ impl OneshotDnsRequest {
         (
             Self {
                 dns_request,
+                span: tracing::Span::current(),
                 sender_for_response,
             },
             receiver,
         )
     }
 
-    fn into_parts(self) -> (DnsRequest, OneshotDnsResponse) {
+    fn into_parts(self) -> (DnsRequest, tracing::Span, OneshotDnsResponse) {
         (
             self.dns_request,
+            self.span,
             OneshotDnsResponse(self.sender_for_response),
         )
     }
 }
 
 struct OneshotDnsResponse(oneshot::Sender<DnsResponseStream>);
+
+/// Target of the tracing events the DNSTAP layer captures.
+pub(crate) const DNSTAP_TARGET: &str = "hickory_server::dnstap";
+
+/// Record the upstream query frame for the current DNSTAP span.
+///
+/// `local_addr` is the sending socket's local endpoint, the initiator of the exchange. Must
+/// run after the message ID is final, so the frame matches the wire bytes.
+pub(crate) fn emit_query_frame(bytes: &[u8], local_addr: Option<SocketAddr>) {
+    if !tracing::enabled!(target: DNSTAP_TARGET, tracing::Level::TRACE) {
+        return;
+    }
+
+    let mut addr_buf = [0u8; 16];
+    let (src_addr_bytes, src_port) = match local_addr {
+        Some(addr) => (ip_octets(addr.ip(), &mut addr_buf), u64::from(addr.port())),
+        None => (&[][..], 0),
+    };
+
+    tracing::event!(
+        target: DNSTAP_TARGET,
+        tracing::Level::TRACE,
+        kind = "query",
+        message_bytes = bytes,
+        src_addr_bytes = src_addr_bytes,
+        src_port = src_port,
+    );
+}
+
+/// IP octets written into a caller buffer, so the emitter allocates nothing.
+fn ip_octets(ip: IpAddr, buf: &mut [u8; 16]) -> &[u8] {
+    match ip {
+        IpAddr::V4(v4) => {
+            buf[..4].copy_from_slice(&v4.octets());
+            &buf[..4]
+        }
+        IpAddr::V6(v6) => {
+            buf.copy_from_slice(&v6.octets());
+            &buf[..]
+        }
+    }
+}
 
 impl OneshotDnsResponse {
     fn send_response(self, serial_response: DnsResponseStream) -> Result<(), DnsResponseStream> {

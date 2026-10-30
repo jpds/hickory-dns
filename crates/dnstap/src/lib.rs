@@ -47,6 +47,21 @@
 //!
 //! All default to `false`.
 //!
+//! Note on upstream traffic: the resolver records every query it sends and
+//! every response it receives. Queries that ask the upstream to recurse (RD
+//! set) are `FORWARDER_QUERY`/`FORWARDER_RESPONSE` messages, while recursor
+//! hops, which clear RD, are `RESOLVER_QUERY`/`RESOLVER_RESPONSE`. Upstream
+//! events carry the upstream address as `response_address`/`response_port` and
+//! the transport as `socket_protocol`; recursor hops also carry the bailiwick
+//! as `query_zone`, while forwarded lookups are recorded without one.
+//! Authoritative response frames carry the answering zone as the bailiwick
+//! (`query_zone`).
+//!
+//! Upstream queries record the sending socket's local endpoint as
+//! `query_address`/`query_port`. An unconnected socket bound to the wildcard reports the
+//! port alone, which is what the upstream server sees in its own record of the query; TCP,
+//! DoT, DoH and DoQ report no initiator.
+//!
 //! # Configuration example
 //!
 //! ```toml

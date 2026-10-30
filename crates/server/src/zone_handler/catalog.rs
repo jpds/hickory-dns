@@ -33,6 +33,7 @@ use crate::{
     proto::{
         op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode},
         rr::{LowerName, Record, RecordType},
+        serialize::binary::BinEncodable,
     },
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     zone_handler::{
@@ -405,6 +406,10 @@ async fn lookup<R: ResponseHandler + Unpin>(
             return send_error_response(request, ResponseCode::ServFail, response_handle).await;
         };
 
+        if tracing::enabled!(target: "hickory_server::dnstap", tracing::Level::TRACE) {
+            emit_zone_event(handler.origin());
+        }
+
         let response_message = match handler.zone_type() {
             ZoneType::Authoritative => {
                 build_authoritative_response(result, request, &**handler).await
@@ -513,6 +518,10 @@ async fn zone_transfer(
             continue;
         };
 
+        if tracing::enabled!(target: "hickory_server::dnstap", tracing::Level::TRACE) {
+            emit_zone_event(handler.origin());
+        }
+
         let mut response_meta = Metadata::response_from_request(&request.metadata);
         let zone_transfer = match result {
             Ok(zone_transfer) => {
@@ -597,6 +606,20 @@ async fn zone_transfer(
 
     error!("end of chained zone handler loop with all zone handlers not answering");
     send_error_response(request, ResponseCode::ServFail, response_handle).await
+}
+
+/// Record the answering zone so the response frame carries the bailiwick.
+///
+/// Callers gate this on the DNSTAP trace target, so a deployment without a
+/// DNSTAP layer never pays for the call.
+fn emit_zone_event(origin: &LowerName) {
+    let zone_wire = origin.to_bytes().unwrap_or_default();
+    tracing::event!(
+        target: "hickory_server::dnstap",
+        tracing::Level::TRACE,
+        kind = "zone",
+        query_zone = zone_wire.as_slice(),
+    );
 }
 
 /// Helper function to construct a response message with an error response code, and send it via a

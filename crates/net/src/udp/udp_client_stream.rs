@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::{FutureExt, Stream, StreamExt, pin_mut, stream::FuturesUnordered};
-use tracing::{debug, trace, warn};
+use tracing::{Instrument, debug, trace, warn};
 
 use crate::error::NetError;
 use crate::proto::op::{DEFAULT_RETRY_FLOOR, DnsRequest, DnsResponse, Message, SerialMessage};
@@ -23,7 +23,7 @@ use crate::proto::rr::TSigner;
 use crate::runtime::{DnsUdpSocket, RuntimeProvider, Spawn, Time};
 use crate::udp::MAX_RECEIVE_BUFFER_SIZE;
 use crate::udp::udp_stream::NextRandomUdpSocket;
-use crate::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream};
+use crate::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream, emit_query_frame};
 
 /// A UDP client stream of DNS binary packets.
 ///
@@ -87,11 +87,11 @@ impl<P: RuntimeProvider> DnsRequestSender for UdpClientStream<P> {
             retry_interval_time
         };
 
-        P::Timer::timeout(
-            self.timeout,
-            retry::<P>(request, retry_interval, max_retries.into()),
-        )
-        .into()
+        // Serialization happens when the retry future is polled, so carry the
+        // request span to it rather than relying on the send call's scope.
+        let send = retry::<P>(request, retry_interval, max_retries.into())
+            .instrument(tracing::Span::current());
+        P::Timer::timeout(self.timeout, send).into()
     }
 
     fn shutdown(&mut self) {
@@ -197,6 +197,9 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
             self.provider.clone(),
         )
         .await?;
+
+        // Emitted after the bind: the port is what identifies this query upstream.
+        emit_query_frame(msg.bytes(), socket.local_addr().ok());
 
         let bytes = msg.bytes();
         let len_sent: usize = socket.send_to(bytes, addr).await?;

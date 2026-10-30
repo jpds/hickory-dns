@@ -81,18 +81,22 @@ struct SpanVisitor {
     server_port: Option<u16>,
     transport: Option<DnsTransport>,
     message_type: Option<DnstapMessageType>,
+    /// Bailiwick carried by upstream query spans.
+    query_zone: Option<Vec<u8>>,
+    /// Send time carried by upstream query spans, pairing the query with its
+    /// response.
+    query_time_sec: Option<u64>,
+    query_time_nsec: Option<u64>,
 }
 
 impl Visit for SpanVisitor {
     fn record_bytes(&mut self, field: &Field, value: &[u8]) {
-        // Emit sites record 4 or 16 octets; an empty slice means the address
-        // is absent and leaves the slot empty.
-        let Some(ip) = parse_ip(value) else {
-            return;
-        };
         match field.name() {
-            "src_addr_bytes" => self.src_ip = Some(ip),
-            "server_addr_bytes" => self.server_ip = Some(ip),
+            // An empty zone field keeps the bailiwick absent.
+            "query_zone" if !value.is_empty() => self.query_zone = Some(value.to_vec()),
+            // An empty slice means absent; otherwise the length selects the IP family.
+            "src_addr_bytes" => self.src_ip = parse_ip(value),
+            "server_addr_bytes" => self.server_ip = parse_ip(value),
             _ => {}
         }
     }
@@ -101,6 +105,8 @@ impl Visit for SpanVisitor {
         match field.name() {
             "src_port" => self.src_port = Some(value as u16),
             "server_port" => self.server_port = Some(value as u16),
+            "query_time_sec" => self.query_time_sec = Some(value),
+            "query_time_nsec" => self.query_time_nsec = Some(value),
             _ => {}
         }
     }
@@ -176,6 +182,7 @@ fn parse_class(s: &str) -> Option<DnstapMessageType> {
         "auth" => Some(DnstapMessageType::Auth),
         "client" => Some(DnstapMessageType::Client),
         "resolver" => Some(DnstapMessageType::Resolver),
+        "forwarder" => Some(DnstapMessageType::Forwarder),
         "update" => Some(DnstapMessageType::Update),
         _ => None,
     }
@@ -306,11 +313,7 @@ fn parse_transport(s: &str) -> Option<DnsTransport> {
     }
 }
 
-/// Build a resolver or forwarder event from the event fields alone.
-///
-/// Upstream events run outside the request span, so `src_addr` stays empty
-/// while the upstream server address and transport are recorded. Recursor
-/// hops carry the bailiwick as the query zone; responses carry the send time.
+/// Build an upstream event from one that has no span; responses carry no initiator.
 fn upstream_event(
     kind: EventKind,
     bytes: Vec<u8>,
@@ -392,8 +395,11 @@ where
             server_addr,
             transport,
             message_type,
-            query_zone: None,
-            query_time: None,
+            query_zone: visitor.query_zone,
+            query_time: visitor
+                .query_time_sec
+                .zip(visitor.query_time_nsec)
+                .map(|(sec, nsec)| (sec, nsec as u32)),
         };
 
         if let Some(span) = ctx.span(id) {
@@ -457,14 +463,17 @@ where
                 let Some(bytes) = visitor.message_bytes else {
                     return;
                 };
+                // The upstream span is created before the client socket exists, so the
+                // initiator arrives on the query event and wins over the span's value.
+                let event_src_addr = visitor
+                    .src_ip
+                    .zip(visitor.src_port)
+                    .map(|(ip, port)| SocketAddr::new(ip, port));
                 // Hold the extensions lock only long enough to mutate span data
                 // and copy out the metadata needed to build the event.
-                let (src_addr, server_addr, transport, message_type, qt) = {
+                let (src_addr, server_addr, transport, message_type, query_time, zone) = {
                     let mut ext = span.extensions_mut();
                     let Some(data) = ext.get_mut::<DnstapSpanData>() else {
-                        return;
-                    };
-                    let Some(src_addr) = data.src_addr else {
                         return;
                     };
                     let Some(transport) = data.transport else {
@@ -473,17 +482,26 @@ where
                     let Some(message_type) = data.message_type else {
                         return;
                     };
-                    let qt = now_time();
-                    data.query_time = Some(qt);
-                    (src_addr, data.server_addr, transport, message_type, qt)
+                    // Upstream spans carry the send time; server spans take the
+                    // time the request arrived.
+                    let query_time = data.query_time.unwrap_or_else(now_time);
+                    data.query_time = Some(query_time);
+                    (
+                        event_src_addr.or(data.src_addr),
+                        data.server_addr,
+                        transport,
+                        message_type,
+                        query_time,
+                        data.query_zone.clone(),
+                    )
                 };
                 self.send(DnstapEvent {
                     message_type,
-                    src_addr: Some(src_addr),
+                    src_addr,
                     server_addr,
                     transport: Some(transport),
-                    query_zone: None,
-                    query_time: qt,
+                    query_zone: zone,
+                    query_time,
                     payload: EventPayload::Query { bytes },
                 });
             }
@@ -803,6 +821,64 @@ mod tests {
             matches!(event.payload, EventPayload::Query { .. }),
             "expected a query event"
         );
+        drop(_guard);
+    }
+
+    /// The resolver's span predates the client socket, so the initiator rides the event.
+    #[test]
+    fn test_upstream_query_takes_initiator_from_event() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let layer = DnstapLayer {
+            queue: EventQueue::with_sender(
+                sender,
+                MessageTypeFilter::from_config(&DnstapConfig {
+                    log_forwarder_query: true,
+                    ..Default::default()
+                }),
+            ),
+        };
+
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let span = tracing::span!(
+            target: DNSTAP_TARGET,
+            tracing::Level::TRACE,
+            "dns.upstream",
+            class = %"forwarder",
+            protocol = %"udp",
+            server_addr_bytes = &Ipv4Addr::new(192, 0, 2, 53).octets()[..],
+            server_port = 53u64,
+            query_zone = &[][..],
+            query_time_sec = 1_000_000u64,
+            query_time_nsec = 0u64,
+        );
+
+        let _enter = span.enter();
+        tracing::event!(
+            target: DNSTAP_TARGET,
+            tracing::Level::TRACE,
+            kind = "query",
+            message_bytes = b"\x12\x34\x01\x00".as_slice(),
+            src_addr_bytes = &Ipv4Addr::UNSPECIFIED.octets()[..],
+            src_port = 35300u64,
+        );
+        drop(_enter);
+
+        let event = receiver.try_recv().expect("forwarder query event");
+        assert_eq!(event.message_type, DnstapMessageType::Forwarder);
+        assert_eq!(event.transport, Some(DnsTransport::Udp));
+        assert_eq!(
+            event.src_addr,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 35300))
+        );
+        assert_eq!(
+            event.server_addr,
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)),
+                53
+            ))
+        );
+        assert!(matches!(event.payload, EventPayload::Query { .. }));
         drop(_guard);
     }
 

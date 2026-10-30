@@ -15,6 +15,7 @@ use crate::{
         ProtoError,
         op::{DnsResponse, Message},
     },
+    xfer::emit_query_frame,
 };
 
 /// ```text
@@ -142,6 +143,9 @@ impl QuicStream {
         message.metadata.id = 0;
 
         let bytes = Bytes::from(message.to_vec()?);
+
+        // The per-query stream does not know the connection's local endpoint.
+        emit_query_frame(&bytes, None);
 
         self.send_bytes(bytes).await
     }

@@ -371,6 +371,10 @@ impl DnsUdpSocket for tokio::net::UdpSocket {
     ) -> Poll<io::Result<usize>> {
         Self::poll_send_to(self, cx, buf, target)
     }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Self::local_addr(self)
+    }
 }
 
 #[cfg(test)]
