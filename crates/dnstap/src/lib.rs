@@ -7,10 +7,20 @@
 //!
 //! # Architecture
 //!
-//! The implementation uses an async client (`DnstapClient`) with a background sender task
-//! connected via an mpsc channel. DNS handler code sends log messages through the channel
-//! without blocking request processing. The background task manages the Frame Streams
-//! connection to the collector, with automatic reconnection and exponential backoff on failure.
+//! There are two integration points, both built on the same background-sender pattern:
+//!
+//! - [`DnstapClient`] - direct API for code that builds and sends DNSTAP events itself.
+//!   Calling [`DnstapClient::new`] immediately spawns a background task.
+//!
+//! - [`DnstapLayer`] - a [`tracing_subscriber::Layer`] that captures DNS events from
+//!   `tracing` spans carrying the `hickory_server::dnstap` target. [`DnstapLayer::new`] returns the layer
+//!   plus a [`DnstapConnection`] handle; call [`DnstapConnection::start`] inside a Tokio
+//!   runtime to spawn the background task. The two-phase design lets the caller control
+//!   when the background task (and its startup log) fires relative to other server startup.
+//!
+//! In both cases the DNS hot path only does a non-blocking channel send. All protobuf
+//! encoding, Frame Streams framing, and collector I/O happen in the background task, which
+//! reconnects with exponential backoff on failure.
 //!
 //! # Supported transports
 //!
@@ -59,17 +69,19 @@ mod client;
 mod dnstap_message;
 mod event;
 mod framestream;
+mod layer;
 
 pub use client::{
     DnstapClient, DnstapConfig, DnstapConnection, DnstapEndpoint, QUEUED_BYTES_PER_EVENT,
 };
 pub use event::DnstapMessageType;
+pub use layer::DnstapLayer;
 
 /// DNS transport protocol for the DNSTAP `socket_protocol` field.
 ///
 /// This is a simplified protocol enum that decouples the DNSTAP crate from
 /// the server's internal `Protocol` type and its feature-gated variants.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DnsTransport {
     /// DNS over UDP (RFC 1035).
     Udp,

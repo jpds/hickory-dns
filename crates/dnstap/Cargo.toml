@@ -7,6 +7,7 @@ Protocol Buffer messages and transports them over Frame Streams.
 """
 
 documentation = "https://docs.rs/hickory-dnstap"
+readme = "README.md"
 
 version.workspace = true
 authors.workspace = true
