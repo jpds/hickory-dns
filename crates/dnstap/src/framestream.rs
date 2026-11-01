@@ -46,12 +46,6 @@ const MAX_DATA_LEN: u32 = 1024 * 1024;
 pub(crate) enum FrameStreamItem {
     /// A data frame; the bytes are one DNSTAP protobuf message.
     Data(Bytes),
-    /// A DNSTAP event to encode as a data frame at write time.
-    ///
-    /// Encoding happens here rather than at the emit site so the protobuf
-    /// bytes land directly in the sink's write buffer with no intermediate
-    /// Vec per event.
-    Event(DnstapEvent),
     /// A control frame, with the value of its content-type field if present.
     Control {
         control_type: u32,
@@ -78,33 +72,52 @@ impl FrameStreamItem {
 }
 
 /// Encoder and decoder for Frame Streams frames.
-///
-/// Carries the identity/version values DNSTAP data frames embed, so data
-/// frames can be encoded directly into the sink's write buffer.
 #[derive(Debug, Default)]
-pub(crate) struct FrameStreamCodec {
-    encoder: EncoderConfig,
-}
+pub(crate) struct FrameStreamCodec;
 
 impl FrameStreamCodec {
-    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn with_encoder(encoder: EncoderConfig) -> Self {
-        Self { encoder }
+        Self
     }
 }
 
 /// Identity and version strings embedded in every message.
 ///
-/// Held behind an `Arc` so the background task shares one copy with the
-/// emitters instead of rebuilding the strings per event.
+/// Held behind an `Arc` so the emit sites share one copy instead of rebuilding
+/// the strings per event.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EncoderConfig {
     pub(crate) identity: Arc<Option<Vec<u8>>>,
     pub(crate) version: Arc<Option<Vec<u8>>>,
+}
+
+/// Encode a DNSTAP event as the protobuf payload of a data frame.
+///
+/// Runs at the emit site, so the sender task only writes bytes. An empty
+/// payload still produces a decodable message because the message type field
+/// is always set.
+pub(crate) fn encode_message(event: &DnstapEvent, enc: &EncoderConfig) -> Bytes {
+    let params = DnstapEventParams {
+        identity: &enc.identity,
+        version: &enc.version,
+        src_addr: event.src_addr,
+        server_addr: event.server_addr,
+        transport: event.transport,
+        query_time: event.query_time,
+        response_time: event.payload.response_time(),
+        message_type: &event.message_type,
+        query_zone: event.query_zone.as_deref(),
+    };
+    let bytes = event.payload.bytes();
+    let dnstap = match &event.payload {
+        EventPayload::Query { .. } => assemble(&params, Some(bytes), None),
+        EventPayload::Response { .. } => assemble(&params, None, Some(bytes)),
+    };
+    let mut buf = BytesMut::with_capacity(dnstap.encoded_len());
+    dnstap
+        .encode(&mut buf)
+        .expect("capacity reserved by encoded_len");
+    buf.freeze()
 }
 
 impl Decoder for FrameStreamCodec {
@@ -205,7 +218,6 @@ impl Encoder<FrameStreamItem> for FrameStreamCodec {
                 dst.put_u32(message.len() as u32);
                 dst.put(message);
             }
-            FrameStreamItem::Event(event) => self.encode_event(event, dst)?,
             FrameStreamItem::Control {
                 control_type,
                 content_type,
@@ -226,42 +238,6 @@ impl Encoder<FrameStreamItem> for FrameStreamCodec {
                 }
             }
         }
-        Ok(())
-    }
-}
-
-impl FrameStreamCodec {
-    /// Encode a DNSTAP event as a data frame appended to `dst`.
-    ///
-    /// The protobuf bytes are written straight into `dst`; only the payload
-    /// fields inside the protobuf struct copy their bytes.
-    fn encode_event(&mut self, event: DnstapEvent, dst: &mut BytesMut) -> io::Result<()> {
-        let bytes = event.payload.bytes();
-        if bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "data frame payload is empty",
-            ));
-        }
-        let params = DnstapEventParams {
-            identity: &self.encoder.identity,
-            version: &self.encoder.version,
-            src_addr: event.src_addr,
-            server_addr: event.server_addr,
-            transport: event.transport,
-            query_time: event.query_time,
-            response_time: event.payload.response_time(),
-            message_type: &event.message_type,
-            query_zone: event.query_zone.as_deref(),
-        };
-        let dnstap = match &event.payload {
-            EventPayload::Query { .. } => assemble(&params, Some(bytes), None),
-            EventPayload::Response { .. } => assemble(&params, None, Some(bytes)),
-        };
-        let len = dnstap.encoded_len();
-        dst.reserve(4 + len);
-        dst.put_u32(len as u32);
-        dnstap.encode(dst).expect("exact frame length reserved");
         Ok(())
     }
 }
@@ -377,10 +353,10 @@ mod tests {
         assert!(codec.decode(&mut buf).is_err());
     }
 
-    /// The codec's Event encode must produce the same wire bytes the old
-    /// build_*_vec plus Data-frame path produced.
+    /// The emit-site encoder must produce the same protobuf bytes the
+    /// assemble path produced when the codec did the encoding at write time.
     #[test]
-    fn test_event_encode_matches_data_path() {
+    fn test_encode_message_matches_assembled_protobuf() {
         let event = DnstapEvent {
             message_type: crate::event::DnstapMessageType::Auth,
             src_addr: Some("192.168.1.1:12345".parse().unwrap()),
@@ -392,37 +368,22 @@ mod tests {
                 bytes: b"\x00\x01\x01\x00".to_vec(),
             },
         };
-
-        // Old path: owned protobuf Vec wrapped in Data.
         let params = DnstapEventParams {
             identity: &None,
             version: &None,
-            src_addr: Some("192.168.1.1:12345".parse().unwrap()),
-            server_addr: Some("192.0.2.53:53".parse().unwrap()),
-            transport: Some(crate::DnsTransport::Udp),
-            query_time: (1_000_000, 500),
-            response_time: Some((2_000_000, 500)),
-            message_type: &crate::event::DnstapMessageType::Auth,
-            query_zone: Some(b"\x07example\x03com\x00"),
+            src_addr: event.src_addr,
+            server_addr: event.server_addr,
+            transport: event.transport,
+            query_time: event.query_time,
+            response_time: None,
+            message_type: &event.message_type,
+            query_zone: event.query_zone.as_deref(),
         };
-        let proto = build_query(&params, event_bytes(&event));
+        let proto = build_query(&params, event.payload.bytes());
 
-        let mut direct = BytesMut::new();
-        FrameStreamCodec::new()
-            .encode(FrameStreamItem::Data(proto.clone().into()), &mut direct)
-            .unwrap();
-
-        let mut via_event = BytesMut::new();
-        FrameStreamCodec::new()
-            .encode(FrameStreamItem::Event(event), &mut via_event)
-            .unwrap();
-
-        assert_eq!(via_event.as_ref(), direct.as_ref());
-        // And the payload matches the plain protobuf bytes.
-        assert_eq!(&via_event[4..], proto.as_slice());
-    }
-
-    fn event_bytes(event: &DnstapEvent) -> &[u8] {
-        event.payload.bytes()
+        assert_eq!(
+            encode_message(&event, &EncoderConfig::default()).as_ref(),
+            proto.as_slice()
+        );
     }
 }

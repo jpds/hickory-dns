@@ -10,6 +10,8 @@
 
 use std::net::SocketAddr;
 
+use bytes::Bytes;
+
 use crate::DnsTransport;
 
 /// DNSTAP message type variants.
@@ -30,10 +32,10 @@ pub enum DnstapMessageType {
     Update,
 }
 
-/// A raw DNS event queued for encoding and transmission.
+/// A raw DNS event, encoded at the emit site and handed to the sender.
 ///
-/// Emitters build these lightweight structs on the request path; the
-/// background sender task encodes them into protobuf frames off the hot path.
+/// Emitters build these structs on the request path; the queue turns each one
+/// into a protobuf message before it reaches the channel.
 ///
 /// The message type is classified by the emitter; each event yields exactly
 /// one frame.
@@ -90,4 +92,23 @@ impl DnstapEvent {
         // query zone, the per-event heap this event holds while queued.
         self.payload.bytes().len() + self.query_zone.as_ref().map_or(0, Vec::len)
     }
+}
+
+/// An event encoded at the emit site, waiting for the sender.
+///
+/// The protobuf message is built on the emitting thread so the background
+/// sender only writes bytes. The metadata next to it is what the counters and
+/// the byte budget need once the event itself is gone.
+#[derive(Debug)]
+pub(crate) struct QueuedEvent {
+    /// One DNSTAP protobuf message, the payload of a data frame.
+    pub(crate) message: Bytes,
+    /// Category for the counters; read only when the metrics feature is on.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) message_type: DnstapMessageType,
+    /// Whether the message is a query, for the direction label.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) query: bool,
+    /// The accounted size, as [`DnstapEvent::payload_len`] reports it.
+    pub(crate) payload_len: usize,
 }

@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::DnsTransport;
 use crate::dnstap_message;
-use crate::event::{DnstapEvent, DnstapMessageType, EventPayload};
+use crate::event::{DnstapEvent, DnstapMessageType, EventPayload, QueuedEvent};
 use crate::framestream::{self, EncoderConfig, FrameStreamCodec, FrameStreamItem};
 #[cfg(feature = "metrics")]
 use crate::metrics::{BatchCounts, DnstapMetrics, DropReason};
@@ -250,8 +250,9 @@ impl DnstapClient {
 /// The client and the tracing layer both hold one, so the filter check and
 /// the drop accounting live in one place.
 pub(crate) struct EventQueue {
-    sender: mpsc::Sender<DnstapEvent>,
+    sender: mpsc::Sender<QueuedEvent>,
     filter: MessageTypeFilter,
+    encoder: EncoderConfig,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
     #[cfg(feature = "metrics")]
@@ -262,16 +263,16 @@ impl EventQueue {
     /// Build the queue and the connection handle for `config`.
     pub(crate) fn new(config: DnstapConfig) -> (Self, DnstapConnection) {
         let filter = MessageTypeFilter::from_config(&config);
-        let (sender, connection) = create_background_sender(
-            config.endpoint,
-            config.buffer_size,
-            config.max_backoff,
-            Arc::new(config.identity),
-            Arc::new(config.version),
-        );
+        let encoder = EncoderConfig {
+            identity: Arc::new(config.identity),
+            version: Arc::new(config.version),
+        };
+        let (sender, connection) =
+            create_background_sender(config.endpoint, config.buffer_size, config.max_backoff);
         let queue = Self {
             sender,
             filter,
+            encoder,
             drop_count: Arc::clone(&connection.drop_count),
             budget: Arc::clone(&connection.budget),
             #[cfg(feature = "metrics")]
@@ -281,26 +282,33 @@ impl EventQueue {
     }
 
     pub(crate) fn send(&self, event: DnstapEvent) {
-        if !self.filter.allows(event.message_type, event.is_query()) {
+        let message_type = event.message_type;
+        let query = event.is_query();
+        if !self.filter.allows(message_type, query) {
             #[cfg(feature = "metrics")]
-            self.metrics
-                .increment_filtered(event.message_type, event.is_query());
+            self.metrics.increment_filtered(message_type, query);
             return;
         }
+        let queued = QueuedEvent {
+            message: framestream::encode_message(&event, &self.encoder),
+            message_type,
+            query,
+            payload_len: event.payload_len(),
+        };
         enqueue(
             &self.sender,
             &self.budget,
             &self.drop_count,
             #[cfg(feature = "metrics")]
             &self.metrics,
-            event,
+            queued,
         );
     }
 
     /// Queue over an existing channel, for tests that read the events.
     #[cfg(test)]
     pub(crate) fn with_sender(
-        sender: mpsc::Sender<DnstapEvent>,
+        sender: mpsc::Sender<QueuedEvent>,
         filter: MessageTypeFilter,
     ) -> Self {
         let budget = Arc::new(ByteBudget::for_buffer(sender.max_capacity()));
@@ -314,6 +322,7 @@ impl EventQueue {
         Self {
             sender,
             filter,
+            encoder: EncoderConfig::default(),
             drop_count: Arc::new(AtomicU64::new(0)),
             budget,
             #[cfg(feature = "metrics")]
@@ -368,17 +377,17 @@ impl ByteBudget {
 }
 
 pub(crate) fn enqueue(
-    sender: &mpsc::Sender<DnstapEvent>,
+    sender: &mpsc::Sender<QueuedEvent>,
     budget: &ByteBudget,
     drop_count: &AtomicU64,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
-    event: DnstapEvent,
+    event: QueuedEvent,
 ) {
-    let len = event.payload_len();
+    let len = event.payload_len;
     #[cfg(feature = "metrics")]
     let message_type = event.message_type;
     #[cfg(feature = "metrics")]
-    let query = event.is_query();
+    let query = event.query;
 
     if budget.try_reserve(len) {
         if sender.try_send(event).is_ok() {
@@ -404,9 +413,7 @@ pub(crate) fn create_background_sender(
     endpoint: DnstapEndpoint,
     buffer_size: usize,
     max_backoff: Duration,
-    identity: Arc<Option<Vec<u8>>>,
-    version: Arc<Option<Vec<u8>>>,
-) -> (mpsc::Sender<DnstapEvent>, DnstapConnection) {
+) -> (mpsc::Sender<QueuedEvent>, DnstapConnection) {
     // `mpsc::channel` panics on zero, so floor a misconfigured `buffer_size`.
     let buffer_size = buffer_size.max(1);
     let max_backoff = max_backoff.max(INITIAL_BACKOFF);
@@ -418,7 +425,6 @@ pub(crate) fn create_background_sender(
         receiver,
         drop_count: Arc::clone(&drop_count),
         budget: Arc::new(ByteBudget::for_buffer(buffer_size)),
-        encoder: EncoderConfig { identity, version },
         #[cfg(feature = "metrics")]
         metrics: DnstapMetrics::default(),
     };
@@ -433,10 +439,9 @@ pub(crate) fn create_background_sender(
 pub struct DnstapConnection {
     endpoint: DnstapEndpoint,
     max_backoff: Duration,
-    receiver: mpsc::Receiver<DnstapEvent>,
+    receiver: mpsc::Receiver<QueuedEvent>,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
-    encoder: EncoderConfig,
     #[cfg(feature = "metrics")]
     metrics: DnstapMetrics,
 }
@@ -459,7 +464,6 @@ impl DnstapConnection {
             self.receiver,
             self.drop_count,
             self.budget,
-            self.encoder,
             #[cfg(feature = "metrics")]
             self.metrics,
         ));
@@ -469,10 +473,9 @@ impl DnstapConnection {
 async fn background_sender(
     endpoint: DnstapEndpoint,
     max_backoff: Duration,
-    mut receiver: mpsc::Receiver<DnstapEvent>,
+    mut receiver: mpsc::Receiver<QueuedEvent>,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
-    enc: EncoderConfig,
     #[cfg(feature = "metrics")] metrics: DnstapMetrics,
 ) {
     let mut backoff = INITIAL_BACKOFF;
@@ -489,7 +492,6 @@ async fn background_sender(
             &mut receiver,
             &drop_count,
             &budget,
-            enc.clone(),
             &mut backoff,
             #[cfg(feature = "metrics")]
             &metrics,
@@ -520,10 +522,9 @@ async fn background_sender(
 
 async fn connect_and_send(
     endpoint: &DnstapEndpoint,
-    receiver: &mut mpsc::Receiver<DnstapEvent>,
+    receiver: &mut mpsc::Receiver<QueuedEvent>,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
-    enc: EncoderConfig,
     backoff: &mut Duration,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -536,7 +537,6 @@ async fn connect_and_send(
                 receiver,
                 drop_count,
                 budget,
-                enc,
                 backoff,
                 #[cfg(feature = "metrics")]
                 metrics,
@@ -552,7 +552,6 @@ async fn connect_and_send(
                 receiver,
                 drop_count,
                 budget,
-                enc,
                 backoff,
                 #[cfg(feature = "metrics")]
                 metrics,
@@ -570,14 +569,13 @@ async fn connect_and_send(
 /// every error here triggers a reconnect in the caller.
 async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
-    receiver: &mut mpsc::Receiver<DnstapEvent>,
+    receiver: &mut mpsc::Receiver<QueuedEvent>,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
-    enc: EncoderConfig,
     backoff: &mut Duration,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut framed = Framed::new(stream, FrameStreamCodec::with_encoder(enc));
+    let mut framed = Framed::new(stream, FrameStreamCodec::new());
 
     // Handshake: READY with our content type, the collector's ACCEPT echoing
     // it, then START.
@@ -652,7 +650,7 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             msg = receiver.recv() => {
                 let Some(event) = msg else { break; };
-                budget.release(event.payload_len());
+                budget.release(event.payload_len);
                 send_event_batch(&mut sink, event, receiver, drop_count, budget, #[cfg(feature = "metrics")] metrics).await?;
                 // After the batch, so an idle queue reads zero instead of the
                 // depth of the last burst.
@@ -726,8 +724,8 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
 /// connection and counted as dropped.
 async fn send_event_batch<S>(
     sink: &mut S,
-    first: DnstapEvent,
-    receiver: &mut mpsc::Receiver<DnstapEvent>,
+    first: QueuedEvent,
+    receiver: &mut mpsc::Receiver<QueuedEvent>,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
@@ -741,26 +739,26 @@ where
     #[cfg(feature = "metrics")]
     let mut counts = BatchCounts::default();
     #[cfg(feature = "metrics")]
-    counts.add(first.message_type, first.is_query());
+    counts.add(first.message_type, first.query);
     #[cfg(feature = "metrics")]
-    let mut bytes = first.payload_len();
+    let mut bytes = first.payload_len;
     #[cfg(feature = "metrics")]
     let write_started = Instant::now();
 
     let result = async {
-        sink.feed(FrameStreamItem::Event(first)).await?;
+        sink.feed(FrameStreamItem::Data(first.message)).await?;
         // Coalesce any further events already queued behind this one; a
         // single flush writes the whole batch.
         while let Ok(next) = receiver.try_recv() {
-            let len = next.payload_len();
+            let len = next.payload_len;
             budget.release(len);
             events += 1;
             #[cfg(feature = "metrics")]
             {
                 bytes += len;
-                counts.add(next.message_type, next.is_query());
+                counts.add(next.message_type, next.query);
             }
-            sink.feed(FrameStreamItem::Event(next)).await?;
+            sink.feed(FrameStreamItem::Data(next.message)).await?;
         }
         sink.flush().await
     }
@@ -787,7 +785,7 @@ where
 
 /// Create a DNSTAP client that sends to a pre-connected stream (for testing).
 #[cfg(test)]
-pub(crate) fn new_with_sender(sender: mpsc::Sender<DnstapEvent>) -> DnstapClient {
+pub(crate) fn new_with_sender(sender: mpsc::Sender<QueuedEvent>) -> DnstapClient {
     DnstapClient {
         queue: EventQueue::with_sender(sender, MessageTypeFilter::permissive()),
     }
@@ -839,7 +837,7 @@ mod tests {
             b"\x00\x01",
         );
         let event = receiver.try_recv().unwrap();
-        assert!(event.is_query(), "expected a query event");
+        assert!(event.query, "expected a query event");
         assert_eq!(event.message_type, DnstapMessageType::Client);
 
         // The filter disables update queries, so this event is never queued.
@@ -961,17 +959,7 @@ mod tests {
             runtime.block_on(async {
                 let (sender, mut receiver) = mpsc::channel(8);
                 sender
-                    .send(DnstapEvent {
-                        message_type: DnstapMessageType::Auth,
-                        src_addr: Some("127.0.0.1:1234".parse().unwrap()),
-                        server_addr: None,
-                        transport: Some(DnsTransport::Udp),
-                        query_zone: None,
-                        query_time: (1_000_000, 0),
-                        payload: EventPayload::Query {
-                            bytes: b"\x00\x01".to_vec(),
-                        },
-                    })
+                    .send(queued(DnstapMessageType::Auth, true))
                     .await
                     .unwrap();
                 drop(sender);
@@ -1044,27 +1032,7 @@ mod tests {
                     (DnstapMessageType::Auth, true),
                     (DnstapMessageType::Client, false),
                 ] {
-                    sender
-                        .send(DnstapEvent {
-                            message_type,
-                            src_addr: Some("127.0.0.1:1234".parse().unwrap()),
-                            server_addr: None,
-                            transport: Some(DnsTransport::Udp),
-                            query_zone: None,
-                            query_time: (1_000_000, 0),
-                            payload: if query {
-                                EventPayload::Query {
-                                    bytes: b"\x00\x01".to_vec(),
-                                }
-                            } else {
-                                EventPayload::Response {
-                                    bytes: b"\x00\x01".to_vec(),
-                                    response_time: (1_000_000, 0),
-                                }
-                            },
-                        })
-                        .await
-                        .unwrap();
+                    sender.send(queued(message_type, query)).await.unwrap();
                 }
                 drop(sender);
 
@@ -1148,10 +1116,7 @@ mod tests {
                 // with the batch still in hand.
                 let (client_side, server_side) = duplex(4096);
                 drop(server_side);
-                let mut sink = Framed::new(
-                    client_side,
-                    FrameStreamCodec::with_encoder(EncoderConfig::default()),
-                );
+                let mut sink = Framed::new(client_side, FrameStreamCodec::new());
 
                 let (_sender, mut receiver) = mpsc::channel(8);
                 let budget = ByteBudget::for_buffer(receiver.max_capacity());
@@ -1159,21 +1124,9 @@ mod tests {
                 let metrics = DnstapMetrics::default();
                 metrics.init(receiver.max_capacity(), budget.limit);
 
-                let event = DnstapEvent {
-                    message_type: DnstapMessageType::Auth,
-                    src_addr: None,
-                    server_addr: None,
-                    transport: None,
-                    query_zone: None,
-                    query_time: (1_000_000, 0),
-                    payload: EventPayload::Query {
-                        bytes: b"\x00\x01".to_vec(),
-                    },
-                };
-
                 let result = send_event_batch(
                     &mut sink,
-                    event,
+                    queued(DnstapMessageType::Auth, true),
                     &mut receiver,
                     &drop_count,
                     &budget,
@@ -1291,16 +1244,11 @@ mod tests {
         let task_drop_count = Arc::clone(&drop_count);
         let sender_task = tokio::spawn(async move {
             let mut backoff = INITIAL_BACKOFF;
-            let enc = EncoderConfig {
-                identity: Arc::new(None),
-                version: Arc::new(None),
-            };
             run_stream(
                 client_side,
                 &mut receiver,
                 &task_drop_count,
                 &task_budget,
-                enc,
                 &mut backoff,
                 #[cfg(feature = "metrics")]
                 &DnstapMetrics::default(),
@@ -1317,18 +1265,7 @@ mod tests {
                 &drop_count,
                 #[cfg(feature = "metrics")]
                 &metrics,
-                DnstapEvent {
-                    message_type: DnstapMessageType::Auth,
-                    src_addr: None,
-                    server_addr: None,
-                    transport: Some(DnsTransport::Udp),
-                    query_zone: None,
-                    query_time: (1_000_000, 0),
-                    payload: EventPayload::Response {
-                        bytes: vec![0xa5; PAYLOAD],
-                        response_time: (1_000_001, 0),
-                    },
-                },
+                queued_response(PAYLOAD),
             );
         }
 
@@ -1432,24 +1369,12 @@ mod tests {
             DnstapEndpoint::Tcp("127.0.0.1:1".parse().unwrap()),
             0,
             Duration::ZERO,
-            Arc::new(None),
-            Arc::new(None),
         );
 
         // A zero-capacity channel would lose nearly every event; the clamp
         // keeps at least one slot.
         sender
-            .try_send(DnstapEvent {
-                message_type: DnstapMessageType::Auth,
-                src_addr: None,
-                server_addr: None,
-                transport: None,
-                query_zone: None,
-                query_time: (1_000_000, 0),
-                payload: EventPayload::Query {
-                    bytes: b"\x00\x01".to_vec(),
-                },
-            })
+            .try_send(queued_query())
             .expect("a clamped channel still accepts an event");
     }
 
@@ -1461,17 +1386,12 @@ mod tests {
         drop(_sender);
 
         let drop_count = Arc::new(AtomicU64::new(0));
-        let enc = EncoderConfig {
-            identity: Arc::new(None),
-            version: Arc::new(None),
-        };
         let sender_loop = background_sender(
             DnstapEndpoint::Tcp("127.0.0.1:1".parse().unwrap()),
             Duration::from_secs(30),
             receiver,
             Arc::clone(&drop_count),
             Arc::new(ByteBudget::for_buffer(8)),
-            enc,
             #[cfg(feature = "metrics")]
             DnstapMetrics::default(),
         );
@@ -1591,17 +1511,85 @@ mod tests {
         Ok(())
     }
 
+    /// The item the emit sites would queue for one auth or client event.
+    #[cfg(feature = "metrics")]
+    fn queued(message_type: DnstapMessageType, query: bool) -> QueuedEvent {
+        let event = DnstapEvent {
+            message_type,
+            src_addr: Some("127.0.0.1:1234".parse().unwrap()),
+            server_addr: None,
+            transport: Some(DnsTransport::Udp),
+            query_zone: None,
+            query_time: (1_000_000, 0),
+            payload: if query {
+                EventPayload::Query {
+                    bytes: b"\x00\x01".to_vec(),
+                }
+            } else {
+                EventPayload::Response {
+                    bytes: b"\x00\x01".to_vec(),
+                    response_time: (1_000_000, 0),
+                }
+            },
+        };
+        QueuedEvent {
+            message: framestream::encode_message(&event, &EncoderConfig::default()),
+            message_type,
+            query,
+            payload_len: event.payload_len(),
+        }
+    }
+
+    /// An encoded auth response carrying `payload` bytes of DNS message.
+    fn queued_response(payload: usize) -> QueuedEvent {
+        let event = DnstapEvent {
+            message_type: DnstapMessageType::Auth,
+            src_addr: None,
+            server_addr: None,
+            transport: Some(DnsTransport::Udp),
+            query_zone: None,
+            query_time: (1_000_000, 0),
+            payload: EventPayload::Response {
+                bytes: vec![0xa5; payload],
+                response_time: (1_000_001, 0),
+            },
+        };
+        QueuedEvent {
+            message: framestream::encode_message(&event, &EncoderConfig::default()),
+            message_type: event.message_type,
+            query: false,
+            payload_len: event.payload_len(),
+        }
+    }
+
+    /// An encoded auth query, for tests that only exercise the channel.
+    fn queued_query() -> QueuedEvent {
+        let event = DnstapEvent {
+            message_type: DnstapMessageType::Auth,
+            src_addr: None,
+            server_addr: None,
+            transport: None,
+            query_zone: None,
+            query_time: (1_000_000, 0),
+            payload: EventPayload::Query {
+                bytes: b"\x00\x01".to_vec(),
+            },
+        };
+        QueuedEvent {
+            message: framestream::encode_message(&event, &EncoderConfig::default()),
+            message_type: event.message_type,
+            query: true,
+            payload_len: event.payload_len(),
+        }
+    }
+
     /// Run `run_stream` over a stream with the default test configuration.
     #[cfg(feature = "metrics")]
     async fn run_test_stream(
         client_side: impl AsyncRead + AsyncWrite + Unpin,
-        receiver: &mut mpsc::Receiver<DnstapEvent>,
+        receiver: &mut mpsc::Receiver<QueuedEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drop_count = Arc::new(AtomicU64::new(0));
-        let enc = EncoderConfig {
-            identity: Arc::new(None),
-            version: Arc::new(None),
-        };
         let budget = ByteBudget::for_buffer(receiver.max_capacity());
         let mut backoff = INITIAL_BACKOFF;
         let metrics = DnstapMetrics::default();
@@ -1611,7 +1599,6 @@ mod tests {
             receiver,
             &drop_count,
             &budget,
-            enc,
             &mut backoff,
             &metrics,
         )
@@ -1621,23 +1608,11 @@ mod tests {
     #[cfg(not(feature = "metrics"))]
     async fn run_test_stream(
         client_side: impl AsyncRead + AsyncWrite + Unpin,
-        receiver: &mut mpsc::Receiver<DnstapEvent>,
+        receiver: &mut mpsc::Receiver<QueuedEvent>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drop_count = Arc::new(AtomicU64::new(0));
-        let enc = EncoderConfig {
-            identity: Arc::new(None),
-            version: Arc::new(None),
-        };
         let budget = ByteBudget::for_buffer(receiver.max_capacity());
         let mut backoff = INITIAL_BACKOFF;
-        run_stream(
-            client_side,
-            receiver,
-            &drop_count,
-            &budget,
-            enc,
-            &mut backoff,
-        )
-        .await
+        run_stream(client_side, receiver, &drop_count, &budget, &mut backoff).await
     }
 }

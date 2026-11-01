@@ -24,9 +24,9 @@ const DNSTAP_TARGET: &str = "hickory_server::dnstap";
 /// and sends them as DNSTAP protobuf messages over Frame Streams.
 ///
 /// The layer is intentionally thin: it captures the raw wire bytes and
-/// metadata from each tracing event and enqueues a lightweight `DnstapEvent`
-/// on the channel.  All protobuf encoding and framing is done by the
-/// background sender task, keeping the DNS hot path free of serialization work.
+/// metadata from each tracing event into a lightweight `DnstapEvent`. The
+/// queue encodes it into a protobuf message on the calling thread, so the
+/// background sender task only writes frames.
 ///
 /// Message classification is done at the emit site and recorded on the
 /// `dns.request` span; resolver and forwarder events carry their fields on the
@@ -554,6 +554,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use prost::Message as ProstMessage;
+
+    use crate::dnstap_message::dnstap_proto::{
+        Message as DnstapMessage, SocketFamily, SocketProtocol, message::Type as MessageType,
+    };
+    use crate::event::QueuedEvent;
+
     use super::*;
     use tokio::sync::mpsc;
     use tracing_subscriber::layer::SubscriberExt;
@@ -581,17 +588,17 @@ mod tests {
         );
         drop(_enter);
 
-        let query = receiver.try_recv().expect("query event");
-        assert!(
-            matches!(query.payload, EventPayload::Query { .. }),
-            "expected a query event"
+        let query = decode(&receiver.try_recv().expect("query event"));
+        assert_eq!(
+            query.query_message.as_deref(),
+            Some(b"\x12\x34\x01\x00".as_slice())
         );
         assert!(query.query_zone.is_none());
 
-        let response = receiver.try_recv().expect("response event");
-        assert!(
-            matches!(response.payload, EventPayload::Response { .. }),
-            "expected a response event"
+        let response = decode(&receiver.try_recv().expect("response event"));
+        assert_eq!(
+            response.response_message.as_deref(),
+            Some(b"\x12\x34\x81\x80".as_slice())
         );
         assert!(response.query_zone.is_none());
         drop(_guard);
@@ -604,11 +611,11 @@ mod tests {
     #[test]
     fn test_non_udp_protocol_parse() {
         for (protocol, expected) in [
-            ("tcp", DnsTransport::Tcp),
-            ("tls", DnsTransport::Tls),
-            ("https", DnsTransport::Https),
-            ("http3", DnsTransport::Https),
-            ("quic", DnsTransport::Quic),
+            ("tcp", SocketProtocol::Tcp),
+            ("tls", SocketProtocol::Dot),
+            ("https", SocketProtocol::Doh),
+            ("http3", SocketProtocol::Doh),
+            ("quic", SocketProtocol::Doq),
         ] {
             let (sender, mut receiver) = mpsc::channel(16);
             let layer = layer_with_sender(sender);
@@ -636,12 +643,13 @@ mod tests {
             );
             drop(_enter);
 
-            let query = receiver.try_recv().expect("query event");
-            assert!(
-                matches!(query.payload, EventPayload::Query { .. }),
-                "expected a query event"
+            let query = decode(&receiver.try_recv().expect("query event"));
+            assert!(query.query_message.is_some(), "expected a query event");
+            assert_eq!(
+                query.socket_protocol,
+                Some(expected as i32),
+                "protocol {protocol}"
             );
-            assert_eq!(query.transport, Some(expected), "protocol {protocol}");
             drop(_guard);
         }
     }
@@ -669,9 +677,9 @@ mod tests {
         );
         drop(_enter);
 
-        let response = receiver.try_recv().expect("response event");
+        let response = decode(&receiver.try_recv().expect("response event"));
         assert!(
-            matches!(response.payload, EventPayload::Response { .. }),
+            response.response_message.is_some(),
             "expected a response event"
         );
         assert_eq!(response.query_zone.as_deref(), Some(ZONE_WIRE));
@@ -695,18 +703,16 @@ mod tests {
         );
         drop(_enter);
 
-        let query = receiver.try_recv().expect("query event");
-        assert!(
-            matches!(query.payload, EventPayload::Query { .. }),
-            "expected a query event"
-        );
-        assert_eq!(query.transport, Some(DnsTransport::Udp));
-        assert_eq!(query.message_type, DnstapMessageType::Auth);
+        let query = decode(&receiver.try_recv().expect("query event"));
+        assert!(query.query_message.is_some(), "expected a query event");
+        assert_eq!(query.socket_protocol, Some(SocketProtocol::Udp as i32));
+        assert_eq!(query.r#type, MessageType::AuthQuery as i32);
         assert_eq!(
-            query.src_addr,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53))
+            query.query_address.as_deref(),
+            Some([192, 0, 2, 1].as_slice())
         );
-        assert_eq!(query.server_addr, None);
+        assert_eq!(query.query_port, Some(53));
+        assert_eq!(query.response_address, None);
         drop(_guard);
     }
 
@@ -737,12 +743,13 @@ mod tests {
             query_time_nsec = 123u64,
         );
 
-        let response = receiver.try_recv().expect("resolver response event");
+        let response = decode(&receiver.try_recv().expect("resolver response event"));
         assert!(
-            matches!(response.payload, EventPayload::Response { .. }),
+            response.response_message.is_some(),
             "expected a response event"
         );
-        assert_eq!(response.query_time, (1_000_000, 123));
+        assert_eq!(response.query_time_sec, Some(1_000_000));
+        assert_eq!(response.query_time_nsec, Some(123));
         drop(_guard);
     }
 
@@ -772,9 +779,10 @@ mod tests {
             query_time_nsec = 123u64,
         );
 
-        let response = receiver.try_recv().expect("resolver response event");
+        let response = decode(&receiver.try_recv().expect("resolver response event"));
         assert!(response.query_zone.is_none());
-        assert_eq!(response.query_time, (1_000_000, 123));
+        assert_eq!(response.query_time_sec, Some(1_000_000));
+        assert_eq!(response.query_time_nsec, Some(123));
         drop(_guard);
     }
 
@@ -805,22 +813,17 @@ mod tests {
             server_port = 853u64,
         );
 
-        let event = receiver.try_recv().expect("forwarder query event");
-        assert_eq!(event.message_type, DnstapMessageType::Forwarder);
-        assert_eq!(event.transport, Some(DnsTransport::Tls));
+        let event = decode(&receiver.try_recv().expect("forwarder query event"));
+        assert_eq!(event.r#type, MessageType::ForwarderQuery as i32);
+        assert_eq!(event.socket_protocol, Some(SocketProtocol::Dot as i32));
         assert_eq!(
-            event.server_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)),
-                853
-            ))
+            event.response_address.as_deref(),
+            Some([192, 0, 2, 53].as_slice())
         );
-        assert!(event.src_addr.is_none());
+        assert_eq!(event.response_port, Some(853));
+        assert_eq!(event.query_address, None);
         assert!(event.query_zone.is_none());
-        assert!(
-            matches!(event.payload, EventPayload::Query { .. }),
-            "expected a query event"
-        );
+        assert!(event.query_message.is_some(), "expected a query event");
         drop(_guard);
     }
 
@@ -864,27 +867,24 @@ mod tests {
         );
         drop(_enter);
 
-        let event = receiver.try_recv().expect("forwarder query event");
-        assert_eq!(event.message_type, DnstapMessageType::Forwarder);
-        assert_eq!(event.transport, Some(DnsTransport::Udp));
+        let event = decode(&receiver.try_recv().expect("forwarder query event"));
+        assert_eq!(event.r#type, MessageType::ForwarderQuery as i32);
+        assert_eq!(event.socket_protocol, Some(SocketProtocol::Udp as i32));
+        assert_eq!(event.socket_family, Some(SocketFamily::Inet as i32));
+        assert_eq!(event.query_address, None);
+        assert_eq!(event.query_port, Some(35300));
         assert_eq!(
-            event.src_addr,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 35300))
+            event.response_address.as_deref(),
+            Some([192, 0, 2, 53].as_slice())
         );
-        assert_eq!(
-            event.server_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)),
-                53
-            ))
-        );
-        assert!(matches!(event.payload, EventPayload::Query { .. }));
+        assert_eq!(event.response_port, Some(53));
+        assert!(event.query_message.is_some(), "expected a query event");
         drop(_guard);
     }
 
     /// Build a layer that enqueues into the given channel without a
     /// background task, so the tests can inspect the events directly.
-    fn layer_with_sender(sender: mpsc::Sender<DnstapEvent>) -> DnstapLayer {
+    fn layer_with_sender(sender: mpsc::Sender<QueuedEvent>) -> DnstapLayer {
         DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,
@@ -910,6 +910,14 @@ mod tests {
             server_port = 0u64,
             class = %"auth",
         )
+    }
+
+    /// Decode the protobuf message the layer queued for a tracing event.
+    fn decode(item: &QueuedEvent) -> DnstapMessage {
+        crate::dnstap_message::dnstap_proto::Dnstap::decode(item.message.as_ref())
+            .expect("queued message decodes")
+            .message
+            .expect("queued message carries a body")
     }
 
     const ZONE_WIRE: &[u8] = b"\x07example\x03com\x00";

@@ -18,9 +18,9 @@
 //!   runtime to spawn the background task. The two-phase design lets the caller control
 //!   when the background task (and its startup log) fires relative to other server startup.
 //!
-//! In both cases the DNS hot path only does a non-blocking channel send. All protobuf
-//! encoding, Frame Streams framing, and collector I/O happen in the background task, which
-//! reconnects with exponential backoff on failure.
+//! In both cases the emitting thread encodes the protobuf message and does a non-blocking
+//! channel send. Frame Streams framing and collector I/O happen in the background task,
+//! which reconnects with exponential backoff on failure.
 //!
 //! # Supported transports
 //!
