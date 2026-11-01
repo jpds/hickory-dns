@@ -562,12 +562,12 @@ mod tests {
     use crate::event::QueuedEvent;
 
     use super::*;
-    use tokio::sync::mpsc;
+    use crate::client::{QueueSender, channel};
     use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn test_response_without_zone_has_no_bailiwick() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = layer_with_sender(sender);
 
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
@@ -617,7 +617,7 @@ mod tests {
             ("http3", SocketProtocol::Doh),
             ("quic", SocketProtocol::Doq),
         ] {
-            let (sender, mut receiver) = mpsc::channel(16);
+            let (sender, receiver) = channel(16);
             let layer = layer_with_sender(sender);
 
             let _guard =
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn test_response_carries_answering_zone() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = layer_with_sender(sender);
 
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_span_fields_parse_to_enums() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = layer_with_sender(sender);
 
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_resolver_response_carries_query_time() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,
@@ -757,7 +757,7 @@ mod tests {
     /// still emits.
     #[test]
     fn test_resolver_response_without_zone() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,
@@ -790,7 +790,7 @@ mod tests {
     /// endpoint and transport, as the protobuf recommends.
     #[test]
     fn test_forwarder_query_carries_upstream_endpoint() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,
@@ -830,7 +830,7 @@ mod tests {
     /// The resolver's span predates the client socket, so the initiator rides the event.
     #[test]
     fn test_upstream_query_takes_initiator_from_event() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let layer = DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,
@@ -884,7 +884,7 @@ mod tests {
 
     /// Build a layer that enqueues into the given channel without a
     /// background task, so the tests can inspect the events directly.
-    fn layer_with_sender(sender: mpsc::Sender<QueuedEvent>) -> DnstapLayer {
+    fn layer_with_sender(sender: QueueSender) -> DnstapLayer {
         DnstapLayer {
             queue: EventQueue::with_sender(
                 sender,

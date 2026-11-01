@@ -21,6 +21,7 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+crossbeam-channel.workspace = true
 futures-util = { workspace = true, default-features = false, features = [
     "std",
     "sink",

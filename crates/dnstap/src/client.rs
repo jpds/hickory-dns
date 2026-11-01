@@ -12,6 +12,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use bytes::Bytes;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -250,7 +251,7 @@ impl DnstapClient {
 /// The client and the tracing layer both hold one, so the filter check and
 /// the drop accounting live in one place.
 pub(crate) struct EventQueue {
-    sender: mpsc::Sender<QueuedEvent>,
+    sender: QueueSender,
     filter: MessageTypeFilter,
     encoder: EncoderConfig,
     drop_count: Arc<AtomicU64>,
@@ -307,16 +308,13 @@ impl EventQueue {
 
     /// Queue over an existing channel, for tests that read the events.
     #[cfg(test)]
-    pub(crate) fn with_sender(
-        sender: mpsc::Sender<QueuedEvent>,
-        filter: MessageTypeFilter,
-    ) -> Self {
-        let budget = Arc::new(ByteBudget::for_buffer(sender.max_capacity()));
+    pub(crate) fn with_sender(sender: QueueSender, filter: MessageTypeFilter) -> Self {
+        let budget = Arc::new(ByteBudget::for_buffer(sender.buffer_size()));
         #[cfg(feature = "metrics")]
         let metrics = {
             // Tests install their recorder before building the queue.
             let metrics = DnstapMetrics::default();
-            metrics.init(sender.max_capacity(), budget.limit);
+            metrics.init(sender.buffer_size(), budget.limit);
             metrics
         };
         Self {
@@ -376,8 +374,103 @@ impl ByteBudget {
     }
 }
 
+/// Producer half of the event queue.
+///
+/// Cloning shares one handle, so the consumer sees the queue close only when
+/// the last client handle drops.
+#[derive(Clone)]
+pub(crate) struct QueueSender {
+    inner: Arc<QueueSenderInner>,
+}
+
+struct QueueSenderInner {
+    queue: Sender<QueuedEvent>,
+    /// Held for the test-only accessor; the consumer keeps its own copy.
+    #[cfg(test)]
+    buffer_size: usize,
+    /// Wakes the sender task; one pending token is enough for any number of
+    /// queued events, so a full wake channel simply means one is already due.
+    wake: mpsc::Sender<()>,
+}
+
+impl QueueSender {
+    /// Queue an event, handing it back when the queue is full or closed.
+    pub(crate) fn try_send(&self, event: QueuedEvent) -> Result<(), QueuedEvent> {
+        match self.inner.queue.try_send(event) {
+            Ok(()) => {
+                let _ = self.inner.wake.try_send(());
+                Ok(())
+            }
+            Err(TrySendError::Full(event) | TrySendError::Disconnected(event)) => Err(event),
+        }
+    }
+
+    /// Capacity the queue was created with.
+    #[cfg(test)]
+    pub(crate) fn buffer_size(&self) -> usize {
+        self.inner.buffer_size
+    }
+}
+
+/// Consumer half of the event queue.
+pub(crate) struct QueueReceiver {
+    queue: Receiver<QueuedEvent>,
+    wake: mpsc::Receiver<()>,
+    /// Read by the metrics setup and by the tests, nowhere else.
+    #[cfg(any(feature = "metrics", test))]
+    buffer_size: usize,
+}
+
+impl QueueReceiver {
+    /// Take an event without blocking.
+    pub(crate) fn try_recv(&self) -> Result<QueuedEvent, TryRecvError> {
+        self.queue.try_recv()
+    }
+
+    /// Wait until a producer queues an event.
+    ///
+    /// Returns as soon as the wake channel closes, which only happens when
+    /// every producer is gone; the queue then reads as disconnected once it
+    /// has been drained.
+    async fn wait(&mut self) {
+        let _ = self.wake.recv().await;
+    }
+
+    /// Capacity the queue was created with.
+    #[cfg(any(feature = "metrics", test))]
+    fn buffer_size(&self) -> usize {
+        self.buffer_size
+    }
+
+    /// True when every producer is gone and nothing is left to deliver.
+    fn is_closed_and_empty(&self) -> bool {
+        self.queue.is_empty() && matches!(self.queue.try_recv(), Err(TryRecvError::Disconnected))
+    }
+}
+
+/// Create a queue of `buffer_size` events with the wakeup the sender task waits on.
+pub(crate) fn channel(buffer_size: usize) -> (QueueSender, QueueReceiver) {
+    let (queue, receiver) = crossbeam_channel::bounded(buffer_size);
+    let (wake, wake_receiver) = mpsc::channel(1);
+    let sender = QueueSender {
+        inner: Arc::new(QueueSenderInner {
+            queue,
+            wake,
+            #[cfg(test)]
+            buffer_size,
+        }),
+    };
+    let receiver = QueueReceiver {
+        queue: receiver,
+        wake: wake_receiver,
+        #[cfg(any(feature = "metrics", test))]
+        buffer_size,
+    };
+    (sender, receiver)
+}
+
 pub(crate) fn enqueue(
-    sender: &mpsc::Sender<QueuedEvent>,
+    sender: &QueueSender,
     budget: &ByteBudget,
     drop_count: &AtomicU64,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
@@ -404,7 +497,7 @@ pub(crate) fn enqueue(
     metrics.increment_dropped(message_type, query, DropReason::BufferFull);
 }
 
-/// Create the mpsc channel for the DNSTAP background sender.
+/// Create the event queue for the DNSTAP background sender.
 ///
 /// Returns the sender (for the layer to enqueue events) and a
 /// [`DnstapConnection`] that must be [`start`](DnstapConnection::start)ed
@@ -413,11 +506,12 @@ pub(crate) fn create_background_sender(
     endpoint: DnstapEndpoint,
     buffer_size: usize,
     max_backoff: Duration,
-) -> (mpsc::Sender<QueuedEvent>, DnstapConnection) {
-    // `mpsc::channel` panics on zero, so floor a misconfigured `buffer_size`.
+) -> (QueueSender, DnstapConnection) {
+    // crossbeam's bounded channel panics on zero, so floor a misconfigured
+    // `buffer_size`.
     let buffer_size = buffer_size.max(1);
     let max_backoff = max_backoff.max(INITIAL_BACKOFF);
-    let (sender, receiver) = mpsc::channel(buffer_size);
+    let (sender, receiver) = channel(buffer_size);
     let drop_count = Arc::new(AtomicU64::new(0));
     let conn = DnstapConnection {
         endpoint,
@@ -439,7 +533,7 @@ pub(crate) fn create_background_sender(
 pub struct DnstapConnection {
     endpoint: DnstapEndpoint,
     max_backoff: Duration,
-    receiver: mpsc::Receiver<QueuedEvent>,
+    receiver: QueueReceiver,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
     #[cfg(feature = "metrics")]
@@ -456,7 +550,7 @@ impl DnstapConnection {
     pub fn start(self) {
         #[cfg(feature = "metrics")]
         self.metrics
-            .init(self.receiver.max_capacity(), self.budget.limit);
+            .init(self.receiver.buffer_size(), self.budget.limit);
 
         tokio::spawn(background_sender(
             self.endpoint,
@@ -473,7 +567,7 @@ impl DnstapConnection {
 async fn background_sender(
     endpoint: DnstapEndpoint,
     max_backoff: Duration,
-    mut receiver: mpsc::Receiver<QueuedEvent>,
+    mut receiver: QueueReceiver,
     drop_count: Arc<AtomicU64>,
     budget: Arc<ByteBudget>,
     #[cfg(feature = "metrics")] metrics: DnstapMetrics,
@@ -483,7 +577,7 @@ async fn background_sender(
     loop {
         // A closed and empty queue means the client is gone; reconnecting
         // with nothing left to deliver would never end.
-        if receiver.is_closed() && receiver.is_empty() {
+        if receiver.is_closed_and_empty() {
             info!("dnstap client shutting down");
             return;
         }
@@ -522,7 +616,7 @@ async fn background_sender(
 
 async fn connect_and_send(
     endpoint: &DnstapEndpoint,
-    receiver: &mut mpsc::Receiver<QueuedEvent>,
+    receiver: &mut QueueReceiver,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
     backoff: &mut Duration,
@@ -569,7 +663,7 @@ async fn connect_and_send(
 /// every error here triggers a reconnect in the caller.
 async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
-    receiver: &mut mpsc::Receiver<QueuedEvent>,
+    receiver: &mut QueueReceiver,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
     backoff: &mut Duration,
@@ -647,45 +741,63 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
     let (mut sink, mut collector) = framed.split();
     loop {
-        tokio::select! {
-            msg = receiver.recv() => {
-                let Some(event) = msg else { break; };
-                budget.release(event.payload_len);
-                send_event_batch(&mut sink, event, receiver, drop_count, budget, #[cfg(feature = "metrics")] metrics).await?;
-                // After the batch, so an idle queue reads zero instead of the
-                // depth of the last burst.
-                #[cfg(feature = "metrics")]
-                metrics.set_buffer(budget.events(), budget.bytes());
-            }
-            frame = collector.next() => {
-                match frame {
-                    // The collector is ending the stream; reply FINISH and
-                    // reconnect.
-                    Some(Ok(FrameStreamItem::Control { control_type: framestream::CONTROL_STOP, .. })) => {
-                        info!("dnstap collector sent STOP, closing stream");
-                        sink.send(FrameStreamItem::bare_control(framestream::CONTROL_FINISH)).await?;
-                        return Err(io::Error::other("dnstap collector sent STOP").into());
+        // The queue is a crossbeam channel, so an empty queue parks here on
+        // the producer wakeup rather than on a scheduler queue.
+        let first = match receiver.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => {
+                tokio::select! {
+                    // Woken by a producer, or by the queue closing: the next
+                    // pass drains what is left and then reports the close.
+                    () = receiver.wait() => {}
+                    frame = collector.next() => {
+                        match frame {
+                            // The collector is ending the stream; reply FINISH and
+                            // reconnect.
+                            Some(Ok(FrameStreamItem::Control { control_type: framestream::CONTROL_STOP, .. })) => {
+                                info!("dnstap collector sent STOP, closing stream");
+                                sink.send(FrameStreamItem::bare_control(framestream::CONTROL_FINISH)).await?;
+                                return Err(io::Error::other("dnstap collector sent STOP").into());
+                            }
+                            // A collector never sends data frames, and stray control
+                            // frames carry no state the sender needs; ignore them.
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => return Err(e.into()),
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "dnstap collector closed the connection",
+                                )
+                                .into())
+                            }
+                        }
                     }
-                    // A collector never sends data frames, and stray control
-                    // frames carry no state the sender needs; ignore them.
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(e.into()),
-                    None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "dnstap collector closed the connection",
-                        )
-                        .into())
+                    _ = interval.tick() => {
+                        let dropped = drop_count.swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
+                            warn!("{dropped} dnstap messages dropped in the last {DROP_REPORT_INTERVAL:?} (channel full)");
+                        }
                     }
                 }
+                continue;
             }
-            _ = interval.tick() => {
-                let dropped = drop_count.swap(0, Ordering::Relaxed);
-                if dropped > 0 {
-                    warn!("{dropped} dnstap messages dropped in the last {DROP_REPORT_INTERVAL:?} (channel full)");
-                }
-            }
-        }
+            Err(TryRecvError::Disconnected) => break,
+        };
+        budget.release(first.payload_len);
+        send_event_batch(
+            &mut sink,
+            first,
+            receiver,
+            drop_count,
+            budget,
+            #[cfg(feature = "metrics")]
+            metrics,
+        )
+        .await?;
+        // After the batch, so an idle queue reads zero instead of the depth of
+        // the last burst.
+        #[cfg(feature = "metrics")]
+        metrics.set_buffer(budget.events(), budget.bytes());
     }
 
     // Channel closed: the client is gone, so deliver the STOP best-effort
@@ -725,7 +837,7 @@ async fn run_stream<S: AsyncRead + AsyncWrite + Unpin>(
 async fn send_event_batch<S>(
     sink: &mut S,
     first: QueuedEvent,
-    receiver: &mut mpsc::Receiver<QueuedEvent>,
+    receiver: &mut QueueReceiver,
     drop_count: &AtomicU64,
     budget: &ByteBudget,
     #[cfg(feature = "metrics")] metrics: &DnstapMetrics,
@@ -785,7 +897,7 @@ where
 
 /// Create a DNSTAP client that sends to a pre-connected stream (for testing).
 #[cfg(test)]
-pub(crate) fn new_with_sender(sender: mpsc::Sender<QueuedEvent>) -> DnstapClient {
+pub(crate) fn new_with_sender(sender: QueueSender) -> DnstapClient {
     DnstapClient {
         queue: EventQueue::with_sender(sender, MessageTypeFilter::permissive()),
     }
@@ -798,7 +910,6 @@ mod tests {
         CONTROL_ACCEPT, CONTROL_FINISH, CONTROL_READY, CONTROL_START, CONTROL_STOP,
     };
     use tokio::io::duplex;
-    use tokio::sync::mpsc;
 
     #[test]
     fn test_message_type_filter() {
@@ -818,7 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_applies_message_type_filter() {
-        let (sender, mut receiver) = mpsc::channel(8);
+        let (sender, receiver) = channel(8);
         let client = DnstapClient {
             queue: EventQueue::with_sender(
                 sender,
@@ -856,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_drops_when_full() {
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = channel(1);
         let client = new_with_sender(sender);
 
         client.log_query(
@@ -890,7 +1001,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
 
         with_local_recorder(&recorder, || {
-            let (sender, _receiver) = mpsc::channel(1);
+            let (sender, _receiver) = channel(1);
             let client = new_with_sender(sender);
 
             client.log_query(
@@ -957,10 +1068,9 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let (sender, mut receiver) = mpsc::channel(8);
+                let (sender, mut receiver) = channel(8);
                 sender
-                    .send(queued(DnstapMessageType::Auth, true))
-                    .await
+                    .try_send(queued(DnstapMessageType::Auth, true))
                     .unwrap();
                 drop(sender);
 
@@ -1027,12 +1137,12 @@ mod tests {
             runtime.block_on(async {
                 // Both events are queued before the sender starts, so they
                 // are written by one flush.
-                let (sender, mut receiver) = mpsc::channel(8);
+                let (sender, mut receiver) = channel(8);
                 for (message_type, query) in [
                     (DnstapMessageType::Auth, true),
                     (DnstapMessageType::Client, false),
                 ] {
-                    sender.send(queued(message_type, query)).await.unwrap();
+                    sender.try_send(queued(message_type, query)).unwrap();
                 }
                 drop(sender);
 
@@ -1118,11 +1228,11 @@ mod tests {
                 drop(server_side);
                 let mut sink = Framed::new(client_side, FrameStreamCodec::new());
 
-                let (_sender, mut receiver) = mpsc::channel(8);
-                let budget = ByteBudget::for_buffer(receiver.max_capacity());
+                let (_sender, mut receiver) = channel(8);
+                let budget = ByteBudget::for_buffer(receiver.buffer_size());
                 let drop_count = AtomicU64::new(0);
                 let metrics = DnstapMetrics::default();
-                metrics.init(receiver.max_capacity(), budget.limit);
+                metrics.init(receiver.buffer_size(), budget.limit);
 
                 let result = send_event_batch(
                     &mut sink,
@@ -1165,7 +1275,7 @@ mod tests {
     async fn test_collector_stop_closes_stream() {
         // The sender stays open for the whole test, so the session can only
         // end through the collector's STOP.
-        let (_keep_open, mut receiver) = mpsc::channel(8);
+        let (_keep_open, mut receiver) = channel(8);
 
         let (client_side, server_side) = duplex(4096);
         let mut server = Framed::new(server_side, FrameStreamCodec::new());
@@ -1206,7 +1316,7 @@ mod tests {
         const EVENTS: usize = 512;
         const PAYLOAD: usize = 64 * 1024;
 
-        let (sender, mut receiver) = mpsc::channel(1024);
+        let (sender, mut receiver) = channel(1024);
         let budget = Arc::new(ByteBudget::for_buffer(1024));
         let drop_count = Arc::new(AtomicU64::new(0));
         let resume = Arc::new(tokio::sync::Notify::new());
@@ -1295,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_wrong_content_type() {
-        let (_keep_open, mut receiver) = mpsc::channel(8);
+        let (_keep_open, mut receiver) = channel(8);
 
         let (client_side, server_side) = duplex(4096);
         let mut server = Framed::new(server_side, FrameStreamCodec::new());
@@ -1331,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_rejects_missing_content_type() {
-        let (_keep_open, mut receiver) = mpsc::channel(8);
+        let (_keep_open, mut receiver) = channel(8);
 
         let (client_side, server_side) = duplex(4096);
         let mut server = Framed::new(server_side, FrameStreamCodec::new());
@@ -1382,7 +1492,7 @@ mod tests {
     async fn test_background_sender_exits_when_client_dropped() {
         // The client is gone and the collector is dead: the loop must exit
         // instead of retrying connects forever.
-        let (_sender, receiver) = mpsc::channel(8);
+        let (_sender, receiver) = channel(8);
         drop(_sender);
 
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -1403,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_teardown_survives_collector_that_never_answers() {
-        let (_keep_open, mut receiver) = mpsc::channel(8);
+        let (_keep_open, mut receiver) = channel(8);
         // Close the client side so run_stream reaches its teardown.
         drop(_keep_open);
 
@@ -1437,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_sends_to_channel() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let client = new_with_sender(sender);
 
         client.log_query(
@@ -1453,7 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_sends_response_to_channel() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, receiver) = channel(16);
         let client = new_with_sender(sender);
 
         client.log_response(
@@ -1587,13 +1697,13 @@ mod tests {
     #[cfg(feature = "metrics")]
     async fn run_test_stream(
         client_side: impl AsyncRead + AsyncWrite + Unpin,
-        receiver: &mut mpsc::Receiver<QueuedEvent>,
+        receiver: &mut QueueReceiver,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drop_count = Arc::new(AtomicU64::new(0));
-        let budget = ByteBudget::for_buffer(receiver.max_capacity());
+        let budget = ByteBudget::for_buffer(receiver.buffer_size());
         let mut backoff = INITIAL_BACKOFF;
         let metrics = DnstapMetrics::default();
-        metrics.init(receiver.max_capacity(), budget.limit);
+        metrics.init(receiver.buffer_size(), budget.limit);
         run_stream(
             client_side,
             receiver,
@@ -1608,10 +1718,10 @@ mod tests {
     #[cfg(not(feature = "metrics"))]
     async fn run_test_stream(
         client_side: impl AsyncRead + AsyncWrite + Unpin,
-        receiver: &mut mpsc::Receiver<QueuedEvent>,
+        receiver: &mut QueueReceiver,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drop_count = Arc::new(AtomicU64::new(0));
-        let budget = ByteBudget::for_buffer(receiver.max_capacity());
+        let budget = ByteBudget::for_buffer(receiver.buffer_size());
         let mut backoff = INITIAL_BACKOFF;
         run_stream(client_side, receiver, &drop_count, &budget, &mut backoff).await
     }
